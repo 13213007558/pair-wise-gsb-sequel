@@ -585,15 +585,40 @@ module Sequel
     #   # INSERT INTO table (x) VALUES (1)
     #   # INSERT INTO table (x) VALUES (2)
     #
-    # Be aware that all hashes should have the same keys if you use this calling method,
-    # otherwise some columns could be missed or set to null instead of to default
-    # values.
+    # Be aware that by default all hashes should have the same keys if you
+    # use this calling method: only the keys of the first hash are inserted,
+    # so columns present only in later rows are silently skipped.
     #
-    # This respects the same options as #import.
+    # This respects the same options as #import. In addition, the
+    # <tt>heterogeneous: true</tt> option enables explicit support for rows
+    # with different keys:
+    #
+    #   DB[:table].multi_insert(
+    #     [{name: 'a'}, {name: 'b', status: nil}],
+    #     heterogeneous: true
+    #   )
+    #   # INSERT INTO "table" ("name") VALUES ('a')
+    #   # INSERT INTO "table" ("name", "status") VALUES ('b', NULL)
+    #
+    # In this mode, columns not present in a row are omitted from the
+    # INSERT, so the database uses the column default for them, while an
+    # explicit +nil+ is still inserted as NULL. Rows are grouped by their
+    # exact key sets and combined using the adapter's multi insert strategy
+    # when possible, subject to the adapter's bind parameter limits and the
+    # :slice/:commit_every options. Empty hashes are inserted as single rows
+    # using DEFAULT VALUES.
+    #
+    # When the caller requests data back (<tt>return: :primary_key</tt> or a
+    # dataset with a RETURNING clause), heterogeneous mode inserts rows one
+    # at a time so the returned values can be associated with the input rows
+    # in order; multi-row RETURNING results are not assumed to come back in
+    # insertion order.
     def multi_insert(hashes, opts=OPTS)
       return if hashes.empty?
+      ds = opts[:server] ? server(opts[:server]) : self
+      return ds._multi_insert_heterogeneous(hashes, opts) if opts[:heterogeneous]
       columns = hashes.first.keys
-      import(columns, hashes.map{|h| columns.map{|c| h[c]}}, opts)
+      ds.import(columns, hashes.map{|h| columns.map{|c| h[c]}}, opts)
     end
 
     # Yields each row in the dataset, but internally uses multiple queries as needed to
@@ -1121,6 +1146,84 @@ module Sequel
 
     protected
 
+    # Insert an array of hashes that can have different sets of keys.
+    # Rows with the same keys are grouped so that columns missing from a row
+    # are not inserted (allowing the database defaults to apply). When the
+    # caller requests primary keys or RETURNING data, insert each row
+    # separately so the results can be paired with the input rows in order,
+    # since the database does not guarantee that multi-row RETURNING results
+    # come back in insertion order.
+    def _multi_insert_heterogeneous(hashes, opts=OPTS)
+      if opts[:return] == :primary_key || @opts[:returning]
+        _multi_insert_heterogeneous_rows(hashes, opts)
+      else
+        _multi_insert_heterogeneous_plan(hashes, opts)
+      end
+    end
+
+    # Heterogeneous insert that returns an array with one entry per input
+    # row, in input order. Each statement is executed by itself, so this is
+    # a row-by-row fallback used only when data must be returned to the
+    # caller.
+    def _multi_insert_heterogeneous_rows(hashes, opts)
+      trans_opts = Hash[opts]
+      trans_opts[:server] = @opts[:server]
+      _import_transaction(hashes, trans_opts) do
+        hashes.map do |hash|
+          res = insert(hash)
+          _multi_insert_row_result(res)
+        end
+      end
+    end
+
+    # Normalize the result of a single-row insert used in heterogeneous
+    # mode. Adapters that get inserted data back via RETURNING/OUTPUT
+    # return an array containing the single returned row, while other
+    # adapters return the primary key or nil.
+    def _multi_insert_row_result(result)
+      result.is_a?(Array) ? result.first : result
+    end
+
+    # Heterogeneous insert that does not return data. Build an insert plan
+    # (groups of rows sharing the same columns, split into statements that
+    # fit the adapter limits) and execute it inside transactions. The
+    # :commit_every/:slice options limit the number of input rows executed
+    # per transaction.
+    def _multi_insert_heterogeneous_plan(hashes, opts)
+      commit_size = opts[:commit_every] || opts[:slice]
+      trans_opts = Hash[opts]
+      trans_opts[:server] = @opts[:server]
+
+      if commit_size
+        offset = 0
+        while offset < hashes.length
+          batch = hashes[offset, commit_size]
+          statements = _heterogeneous_insert_statements(batch, opts)
+          _import_transaction(statements, trans_opts){statements.each{|st| execute_dui(st)}}
+          offset += commit_size
+        end
+      else
+        statements = _heterogeneous_insert_statements(hashes, opts)
+        _import_transaction(statements, trans_opts){statements.each{|st| execute_dui(st)}}
+      end
+      nil
+    end
+
+    # Return the INSERT statements needed for the given subset of
+    # heterogeneous hashes, based on the insert plan. Empty hashes use
+    # single-row DEFAULT VALUES statements.
+    def _heterogeneous_insert_statements(hashes, opts)
+      statements = []
+      _heterogeneous_insert_plans(hashes, opts).each do |columns, rows|
+        if columns.empty?
+          rows.length.times{statements << insert_sql({})}
+        else
+          multi_insert_sql(columns, rows).each{|st| statements << st}
+        end
+      end
+      statements
+    end
+
     # Internals of #import.  If primary key values are requested, use
     # separate insert commands for each row.  Otherwise, call #multi_insert_sql
     # and execute each statement it gives separately. A transaction is only used
@@ -1165,6 +1268,57 @@ module Sequel
     
     private
     
+    # Build the insert plan for an array of heterogeneous hashes. Returns an
+    # array of pairs of columns and value arrays, where all values in a pair
+    # use exactly the given columns. Consecutive rows with the same key set
+    # are combined, and each group is split into statements no larger than
+    # allowed by the :slice/:commit_every options, the adapter's default
+    # import slice, and the adapter's bind parameter limit.
+    def _heterogeneous_insert_plans(hashes, opts)
+      plans = []
+      slice_size = opts[:commit_every] || opts[:slice] || default_import_slice
+
+      columns = nil
+      rows = nil
+      group_slice = nil
+
+      flush = lambda do
+        if columns
+          if columns.empty?
+            plans << [[], Array.new(rows.length)]
+          else
+            offset = 0
+            while offset < rows.length
+              current_group_slice = group_slice == 0 ? rows.length : group_slice
+              plans << [columns, rows[offset, current_group_slice]]
+              offset += current_group_slice
+            end
+          end
+        end
+      end
+
+      hashes.each do |hash|
+        keys = hash.keys
+        if keys != columns
+          flush.call
+          columns = keys
+          rows = []
+          if keys.empty?
+            group_slice = 1
+          else
+            max_params = max_input_parameters
+            param_slice = max_params ? (max_params / keys.length) : nil
+            group_slice = [slice_size, param_slice].compact.min
+            # 0 means there is no limit on the number of rows per statement
+            group_slice = group_slice.nil? ? 0 : 1 if group_slice.nil? || group_slice < 1
+          end
+        end
+        rows << columns.map{|c| hash[c]}
+      end
+      flush.call
+      plans
+    end
+
     # Internals of all and with_sql_all
     def _all(block)
       a = []
@@ -1239,6 +1393,15 @@ module Sequel
     # The default number of rows that can be inserted in a single INSERT statement via import.
     # The default is for no limit.
     def default_import_slice
+      nil
+    end
+
+    # The maximum number of bind parameters supported in a single statement
+    # by the database. Used to split heterogeneous multi inserts into
+    # statements that do not exceed the limit. By default there is no known
+    # limit, in which case only the :slice/:commit_every options and
+    # #default_import_slice limit the number of rows per statement.
+    def max_input_parameters
       nil
     end
 

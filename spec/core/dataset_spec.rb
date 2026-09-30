@@ -3850,6 +3850,142 @@ describe "Dataset#multi_insert" do
     @ds.multi_insert([])
     @db.sqls.must_equal []
   end
+
+  it "should return nil without a query in heterogeneous mode if no values" do
+    @ds.multi_insert([], :heterogeneous=>true).must_be_nil
+    @db.sqls.must_equal []
+  end
+
+  it "should group rows by their key sets in heterogeneous mode" do
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) VALUES ('a')",
+      "INSERT INTO items (name, status) VALUES ('b', NULL)",
+      "INSERT INTO items (name) VALUES ('c')",
+      'COMMIT']
+  end
+
+  it "should combine consecutive rows with the same key set using the multi insert strategy" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}, {:name=>'d'}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) VALUES ('a')",
+      "INSERT INTO items (name, status) VALUES ('b', NULL)",
+      "INSERT INTO items (name) VALUES ('c'), ('d')",
+      'COMMIT']
+  end
+
+  it "should keep columns present only in later rows in heterogeneous mode" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b'}, {:name=>'c', :note=>'n'}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) VALUES ('a'), ('b')",
+      "INSERT INTO items (name, note) VALUES ('c', 'n')",
+      'COMMIT']
+  end
+
+  it "should insert empty hashes as single DEFAULT VALUES statements in heterogeneous mode" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.multi_insert([{}, {:name=>'a'}, {}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      'INSERT INTO items DEFAULT VALUES',
+      "INSERT INTO items (name) VALUES ('a')",
+      'INSERT INTO items DEFAULT VALUES',
+      'COMMIT']
+  end
+
+  it "should combine rows using the union multi insert strategy in heterogeneous mode" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :union end}
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b'}, {:name=>'c', :status=>nil}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) SELECT 'a' UNION ALL SELECT 'b'",
+      "INSERT INTO items (name, status) SELECT 'c', NULL",
+      'COMMIT']
+  end
+
+  it "should split heterogeneous groups according to the :slice option" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b'}, {:name=>'c'}, {:name=>'d', :status=>nil}, {:name=>'e', :status=>'x'}], :heterogeneous=>true, :slice=>2)
+    @db.sqls.must_equal [
+      "INSERT INTO items (name) VALUES ('a'), ('b')",
+      "INSERT INTO items (name) VALUES ('c')",
+      "INSERT INTO items (name, status) VALUES ('d', NULL)",
+      "INSERT INTO items (name, status) VALUES ('e', 'x')"]
+  end
+
+  it "should use the :commit_every option to open a transaction every x rows in heterogeneous mode" do
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}], :heterogeneous=>true, :commit_every=>1)
+    @db.sqls.must_equal [
+      "INSERT INTO items (name) VALUES ('a')",
+      "INSERT INTO items (name, status) VALUES ('b', NULL)",
+      "INSERT INTO items (name) VALUES ('c')"]
+  end
+
+  it "should split heterogeneous groups according to the adapter bind parameter limit" do
+    @ds = @ds.with_extend do
+      def multi_insert_sql_strategy; :values end
+      def max_input_parameters; 4 end
+    end
+    @ds.multi_insert([{:name=>'a', :status=>nil}, {:name=>'b', :status=>nil}, {:name=>'c', :status=>nil}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name, status) VALUES ('a', NULL), ('b', NULL)",
+      "INSERT INTO items (name, status) VALUES ('c', NULL)",
+      'COMMIT']
+
+    @ds.multi_insert([{:a=>1, :b=>2, :c=>3, :d=>4, :e=>5}], :heterogeneous=>true)
+    @db.sqls.must_equal ["INSERT INTO items (a, b, c, d, e) VALUES (1, 2, 3, 4, 5)"]
+  end
+
+  it "should use the smallest of the slice and bind parameter limits" do
+    @ds = @ds.with_extend do
+      def multi_insert_sql_strategy; :values end
+      def max_input_parameters; 6 end
+    end
+    @ds.multi_insert([{:a=>1, :b=>2}, {:a=>3, :b=>4}, {:a=>5, :b=>6}, {:a=>7, :b=>8}], :heterogeneous=>true, :slice=>2)
+    @db.sqls.must_equal [
+      "INSERT INTO items (a, b) VALUES (1, 2), (3, 4)",
+      "INSERT INTO items (a, b) VALUES (5, 6), (7, 8)"]
+
+    @ds.multi_insert([{:a=>1, :b=>2}, {:a=>3, :b=>4}, {:a=>5, :b=>6}, {:a=>7, :b=>8}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (a, b) VALUES (1, 2), (3, 4), (5, 6)",
+      "INSERT INTO items (a, b) VALUES (7, 8)",
+      'COMMIT']
+  end
+
+  it "should use separate inserts in heterogeneous mode when returning primary keys" do
+    @db.autoid = 10
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}], :heterogeneous=>true, :return=>:primary_key).must_equal [10, 11, 12]
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) VALUES ('a')",
+      "INSERT INTO items (name, status) VALUES ('b', NULL)",
+      "INSERT INTO items (name) VALUES ('c')",
+      'COMMIT']
+  end
+
+  it "should use separate inserts in heterogeneous mode when the dataset uses RETURNING" do
+    @db.extend_datasets do
+      def multi_insert_sql_strategy; :values end
+      def supports_returning?(type); type == :insert end
+      def uses_returning?(type); type == :insert end
+      def insert_sql(*a); super + ' RETURNING id' end
+    end
+    @ds = @db[:items].returning(:id)
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b', :status=>nil}], :heterogeneous=>true)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) VALUES ('a') RETURNING id",
+      "INSERT INTO items (name, status) VALUES ('b', NULL) RETURNING id",
+      'COMMIT']
+  end
+
+  it "should respect :server option in heterogeneous mode" do
+    @ds.multi_insert([{:name=>'a'}, {:name=>'b', :status=>nil}], :heterogeneous=>true, :server=>:s1)
+    @db.sqls.must_equal ['BEGIN -- s1',
+      "INSERT INTO items (name) VALUES ('a') -- s1",
+      "INSERT INTO items (name, status) VALUES ('b', NULL) -- s1",
+      'COMMIT -- s1']
+  end
 end
 
 describe "Dataset#update_sql" do

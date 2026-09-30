@@ -1163,3 +1163,119 @@ describe 'temporarily_release_connection plugin' do
     db[:i].count.must_equal 0
   end
 end if DB.adapter_scheme == :sqlite
+
+describe 'SQLite Dataset#multi_insert heterogeneous rows' do
+  before do
+    @db = Sequel.sqlite
+    @db.create_table(:items) do
+      primary_key :id
+      String :name
+      String :status, :default=>'ready'
+      Integer :quantity, :default=>1
+    end
+    @ds = @db[:items]
+  end
+
+  it "should use database defaults for missing columns and NULL for explicit nils" do
+    @ds.multi_insert(
+      [{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}],
+      :heterogeneous=>true
+    )
+    @ds.order(:id).all.must_equal [
+      {:id=>1, :name=>'a', :status=>'ready', :quantity=>1},
+      {:id=>2, :name=>'b', :status=>nil, :quantity=>1},
+      {:id=>3, :name=>'c', :status=>'ready', :quantity=>1},
+    ]
+  end
+
+  it "should not lose columns present only in later rows" do
+    @ds.multi_insert(
+      [{:name=>'a'}, {:name=>'b'}, {:name=>'c', :status=>'done', :quantity=>3}],
+      :heterogeneous=>true
+    )
+    @ds.order(:id).all.must_equal [
+      {:id=>1, :name=>'a', :status=>'ready', :quantity=>1},
+      {:id=>2, :name=>'b', :status=>'ready', :quantity=>1},
+      {:id=>3, :name=>'c', :status=>'done', :quantity=>3},
+    ]
+  end
+
+  it "should keep old mode backward compatible (first row keys only)" do
+    @ds.multi_insert(
+      [{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c', :quantity=>9}]
+    )
+    @ds.order(:id).all.must_equal [
+      {:id=>1, :name=>'a', :status=>'ready', :quantity=>1},
+      {:id=>2, :name=>'b', :status=>'ready', :quantity=>1},
+      {:id=>3, :name=>'c', :status=>'ready', :quantity=>1},
+    ]
+  end
+
+  it "should support rows that are all empty" do
+    @ds.multi_insert([{}, {:name=>'x'}, {}], :heterogeneous=>true)
+    @ds.order(:id).all.must_equal [
+      {:id=>1, :name=>nil, :status=>'ready', :quantity=>1},
+      {:id=>2, :name=>'x', :status=>'ready', :quantity=>1},
+      {:id=>3, :name=>nil, :status=>'ready', :quantity=>1},
+    ]
+  end
+
+  it "should return primary keys corresponding to input rows" do
+    rows = [{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}]
+    ids = @ds.multi_insert(rows, :heterogeneous=>true, :return=>:primary_key)
+    ids.must_equal [1, 2, 3]
+    @ds.where(:id=>ids[1]).get(:status).must_be_nil
+    @ds.where(:id=>ids[0]).get(:status).must_equal 'ready'
+  end
+
+  it "should return RETURNING rows corresponding to input rows" do
+    rows = [{:name=>'a'}, {:name=>'b', :status=>nil}, {:name=>'c'}]
+    results = @ds.returning(:id, :name, :status).multi_insert(rows, :heterogeneous=>true)
+    results.must_equal [
+      {:id=>1, :name=>'a', :status=>'ready'},
+      {:id=>2, :name=>'b', :status=>nil},
+      {:id=>3, :name=>'c', :status=>'ready'},
+    ]
+  end if DB.sqlite_version >= 33500
+
+  it "should roll back all rows when a statement fails in plan mode" do
+    proc do
+      @ds.multi_insert(
+        [{:name=>'a'}, {:name=>'b', :bogus=>1}],
+        :heterogeneous=>true
+      )
+    end.must_raise Sequel::DatabaseError
+    @ds.count.must_equal 0
+  end
+
+  it "should roll back all rows when a statement fails in return mode" do
+    proc do
+      @ds.multi_insert(
+        [{:name=>'a'}, {:name=>'b', :bogus=>1}],
+        :heterogeneous=>true, :return=>:primary_key
+      )
+    end.must_raise Sequel::DatabaseError
+    @ds.count.must_equal 0
+  end
+
+  it "should roll back the rows of a slice when a later statement in it fails" do
+    proc do
+      @ds.multi_insert(
+        [{:name=>'a'}, {:name=>'b'}, {:name=>'c', :bogus=>1}],
+        :heterogeneous=>true, :slice=>5
+      )
+    end.must_raise Sequel::DatabaseError
+    @ds.count.must_equal 0
+  end
+
+  it "should split rows to respect the adapter bind parameter limit" do
+    ds = @ds.with_extend{def max_input_parameters; 4 end}
+    ds.multi_insert(Array.new(5){{:name=>'x'}}, :heterogeneous=>true)
+    @ds.count.must_equal 5
+  end
+
+  it "should split many homogeneous rows into multiple statements" do
+    @ds.multi_insert(Array.new(1000){{:name=>'x'}}, :heterogeneous=>true)
+    @ds.count.must_equal 1000
+  end
+end if defined?(SQLite3::Database)

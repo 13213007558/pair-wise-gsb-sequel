@@ -1,5 +1,7 @@
 === master
 
+* Add heterogeneous: true option to Dataset#multi_insert for inserting hashes with different sets of keys, using database defaults for missing columns and NULL for explicit nils, respecting adapter bind parameter limits and returning primary keys/RETURNING rows aligned to input rows
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

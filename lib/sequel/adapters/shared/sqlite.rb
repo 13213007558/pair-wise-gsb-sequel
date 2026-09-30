@@ -933,6 +933,13 @@ module Sequel
         500
       end
 
+      # SQLite supports a maximum of 999 bound variables (SQLITE_MAX_VARIABLE_NUMBER)
+      # in versions before 3.32.0, and 32766 in later versions. Use the lower
+      # limit so heterogeneous multi inserts work on all supported versions.
+      def max_input_parameters
+        999
+      end
+
       # The strftime format to use when literalizing the time.
       def default_timestamp_format
         db.use_timestamp_timezones? ? "'%Y-%m-%d %H:%M:%S.%6N%z'" : super
