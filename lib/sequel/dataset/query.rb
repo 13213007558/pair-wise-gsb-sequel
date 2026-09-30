@@ -43,7 +43,7 @@ module Sequel
       add_graph_aliases distinct except exclude exclude_having
       filter for_update from from_self graph grep group group_and_count group_append group_by having intersect invert
       limit lock_style naked offset or order order_append order_by order_more order_prepend qualify
-      reverse reverse_order select select_all select_append select_group select_more select_prepend server
+      relational_divide reverse reverse_order select select_all select_append select_group select_more select_prepend server
       set_graph_aliases unfiltered ungraphed ungrouped union
       unlimited unordered where with with_recursive with_sql
     METHS
@@ -159,6 +159,97 @@ module Sequel
       raise(InvalidOperation, "EXCEPT ALL not supported") if opts[:all] && !supports_intersect_except_all?
       compound_clone(:except, dataset, opts)
     end
+
+    # Divide the receiver by +requirements+ using +associations+ as the
+    # relationship between candidates and requirements.  This returns
+    # candidates whose associated key values are related to the required key
+    # values.
+    #
+    # The receiver, associations, and requirements must all be datasets.
+    # +candidate_keys+ maps candidate columns to association columns, and
+    # +requirement_keys+ maps requirement columns to association columns. Both
+    # support one or more columns; keys can be symbols or SQL expressions.
+    #
+    # Options:
+    # :mode :: Use +:at_least+ (the default) for containment, allowing
+    #          candidates to have additional associated key values. +:contains+
+    #          is accepted as an alias. Use +:exact+ to require exactly the
+    #          required distinct key values.
+    # :null_equality :: Use +:sql+ (the default) for SQL equality semantics,
+    #                   where +NULL = NULL+ is unknown and NULLs never match.
+    #                   Use +:equal+ to treat NULL values on both sides as equal.
+    #
+    # Duplicate rows in the association dataset do not affect the result. If the
+    # requirements dataset is empty, containment division returns every
+    # candidate (including candidates with no association rows), while exact
+    # division returns only candidates with no distinct associated key rows.
+    #
+    #   people.relational_divide(qualifications, required_skills,
+    #     candidate_keys: [[:id, :person_id]],
+    #     requirement_keys: [[:skill_name, :skill_name]])
+    def relational_divide(associations, requirements, opts=OPTS)
+      raise(Error, "associations must be a Dataset") unless associations.is_a?(Dataset)
+      raise(Error, "requirements must be a Dataset") unless requirements.is_a?(Dataset)
+      raise(Error, "relational division datasets must use the same database") unless associations.db.equal?(db) && requirements.db.equal?(db)
+
+      mode = opts.fetch(:mode, :at_least)
+      case mode
+      when :at_least, :contains
+        exact = false
+      when :exact
+        exact = true
+      else
+        raise(Error, "unsupported relational division mode: #{mode.inspect}")
+      end
+
+      null_equality = opts.fetch(:null_equality, :sql)
+      unless [:sql, :equal].include?(null_equality)
+        raise(Error, ":null_equality must be :sql or :equal")
+      end
+
+      candidate_pairs = relational_division_key_pairs(opts[:candidate_keys])
+      requirement_pairs = relational_division_key_pairs(opts[:requirement_keys])
+      raise(Error, "candidate and requirement key counts must match") unless candidate_pairs.length == requirement_pairs.length
+
+      bind_vars = relational_division_bind_vars(self, associations, requirements)
+      candidate_alias = unused_table_alias(:rd_candidates)
+      association_alias = unused_table_alias(:rd_associations)
+      requirement_alias = unused_table_alias(:rd_requirements)
+
+      candidate_ds = from_self(:alias=>candidate_alias)
+      association_ds = associations.from_self(:alias=>association_alias)
+      requirement_ds = requirements.from_self(:alias=>requirement_alias)
+
+      candidate_to_association_pairs = candidate_pairs.map do |candidate_key, association_key|
+        [Sequel.deep_qualify(candidate_alias, candidate_key), Sequel.deep_qualify(association_alias, association_key)]
+      end
+      missing_match = relational_division_match_condition(
+        requirement_pairs.map do |requirement_key, association_key|
+          [Sequel.deep_qualify(requirement_alias, requirement_key), Sequel.deep_qualify(association_alias, association_key)]
+        end,
+        null_equality)
+      matching_association = association_ds.where(relational_division_match_condition(candidate_to_association_pairs, null_equality))
+      missing = requirement_ds.exclude(matching_association.where(missing_match).exists)
+
+      conditions = [~missing.exists]
+
+      if exact
+        extra_match = relational_division_match_condition(
+          requirement_pairs.map do |requirement_key, association_key|
+            [Sequel.deep_qualify(association_alias, association_key), Sequel.deep_qualify(requirement_alias, requirement_key)]
+          end,
+          null_equality)
+        extra = association_ds.
+          where(relational_division_match_condition(candidate_to_association_pairs, null_equality)).
+          exclude(requirement_ds.where(extra_match).exists)
+        conditions << ~extra.exists
+      end
+
+      result = candidate_ds.where(conditions.inject(:&))
+      bind_vars.empty? ? result : result.bind(bind_vars)
+    end
+
+    alias divide relational_divide
 
     # Performs the inverse of Dataset#where.  Note that if you have multiple filter
     # conditions, this is not the same as a negation of all conditions.
@@ -1353,6 +1444,58 @@ module Sequel
     end
 
     private
+
+    def relational_division_bind_vars(*datasets)
+      merged = {}
+      datasets.each do |dataset|
+        next unless variables = dataset.opts[:bind_vars]
+        variables.each do |key, value|
+          if merged.key?(key) && merged[key] != value
+            raise(Error, "can't relational divide datasets with conflicting bind variable values for #{key.inspect}")
+          end
+          merged[key] = value
+        end
+      end
+      merged.freeze
+    end
+
+    def relational_division_key_pairs(keys)
+      case keys
+      when nil
+        raise(Error, "relational division requires key mappings")
+      when Array
+        pairs = keys.map do |key|
+          if key.is_a?(Array) && key.length == 2
+            key
+          elsif key.is_a?(Array)
+            raise(Error, "relational division key pairs must have two entries")
+          else
+            [key, key]
+          end
+        end
+      when Hash
+        pairs = keys.to_a
+      else
+        raise(Error, "relational division key mappings must be an Array or Hash")
+      end
+      raise(Error, "relational division requires at least one key") if pairs.empty?
+      pairs.freeze
+    end
+
+    def relational_division_match_condition(pairs, null_equality)
+      conditions = pairs.map do |left, right|
+        equality = SQL::BooleanExpression.from_value_pairs([[left, right]])
+        if null_equality == :equal
+          both_null = SQL::BooleanExpression.new(:AND,
+            SQL::BooleanExpression.from_value_pairs([[left, nil]]),
+            SQL::BooleanExpression.from_value_pairs([[right, nil]]))
+          equality | both_null
+        else
+          equality
+        end
+      end
+      conditions.length == 1 ? conditions.first : SQL::BooleanExpression.new(:AND, *conditions)
+    end
 
     # simplecov:disable
     unless TRUE_FREEZE

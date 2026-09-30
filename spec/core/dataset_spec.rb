@@ -363,6 +363,68 @@ describe "Dataset#exists" do
   end
 end
 
+describe "Dataset#relational_divide" do
+  before do
+    @db = Sequel.mock
+    @candidates = @db[:people].where(:active)
+    @associations = @db[:qualifications].where(:archived=>false)
+    @requirements = @db[:required_skills]
+    @opts = {
+      :candidate_keys=>[[:id, :person_id]],
+      :requirement_keys=>[[:skill_name, :skill_name]],
+    }
+  end
+
+  it "should perform a containment division using correlated NOT EXISTS clauses" do
+    @candidates.relational_divide(@associations, @requirements, @opts).sql.must_equal \
+      "SELECT * FROM (SELECT * FROM people WHERE active) AS rd_candidates " \
+      "WHERE NOT (EXISTS (SELECT * FROM (SELECT * FROM required_skills) AS rd_requirements " \
+      "WHERE NOT (EXISTS (SELECT * FROM (SELECT * FROM qualifications WHERE (archived IS FALSE)) AS rd_associations " \
+      "WHERE ((rd_candidates.id = rd_associations.person_id) " \
+      "AND (rd_requirements.skill_name = rd_associations.skill_name))))))"
+  end
+
+  it "should support exact division, multiple keys, and NULL-aware equality" do
+    sql = @candidates.relational_divide(@associations, @requirements,
+      :mode=>:exact,
+      :null_equality=>:equal,
+      :candidate_keys=>{:id=>:person_id, :kind=>:kind},
+      :requirement_keys=>{:skill_name=>:skill_name, :required_kind=>:kind}).sql
+    sql.must_include "((rd_candidates.id = rd_associations.person_id) OR ((rd_candidates.id IS NULL) AND (rd_associations.person_id IS NULL)))"
+    sql.must_include "(rd_requirements.skill_name = rd_associations.skill_name) OR ((rd_requirements.skill_name IS NULL) AND (rd_associations.skill_name IS NULL))"
+    sql.must_include "AND NOT (EXISTS (SELECT * FROM (SELECT * FROM qualifications WHERE (archived IS FALSE)) AS rd_associations"
+    sql.must_include "NOT (EXISTS (SELECT * FROM (SELECT * FROM required_skills) AS rd_requirements"
+  end
+
+  it "should accept Dataset subselects and preserve their filters and bind variables" do
+    associations = @associations.where(:kind=>:$kind).bind(:kind=>"math")
+    requirements = @requirements.where(:level=>:$level).bind(:level=>3)
+    ds = @candidates.relational_divide(associations, requirements, @opts)
+    @db.sqls.clear
+    ds.call(:select)
+    sql = @db.sqls.first
+    sql.must_include "SELECT * FROM (SELECT * FROM qualifications WHERE ((archived IS FALSE) AND (kind = 'math'))) AS rd_associations"
+    sql.must_include "SELECT * FROM (SELECT * FROM required_skills WHERE (level = 3)) AS rd_requirements"
+  end
+
+  it "should return immutable copies" do
+    ds = @candidates.relational_divide(@associations, @requirements, @opts)
+    ds.wont_be_same_as @candidates
+    @candidates.sql.must_equal "SELECT * FROM people WHERE active"
+    @associations.sql.must_equal "SELECT * FROM qualifications WHERE (archived IS FALSE)"
+  end
+
+  it "should validate arguments" do
+    other_db = Sequel.mock
+    proc{@candidates.relational_divide(:a, @requirements, @opts)}.must_raise Sequel::Error
+    proc{@candidates.relational_divide(other_db[:a], @requirements, @opts)}.must_raise Sequel::Error
+    proc{@candidates.relational_divide(@associations, @requirements, @opts.merge(:mode=>:foo))}.must_raise Sequel::Error
+    proc{@candidates.relational_divide(@associations, @requirements, @opts.merge(:null_equality=>:foo))}.must_raise Sequel::Error
+    proc{@candidates.relational_divide(@associations, @requirements, @opts.merge(:requirement_keys=>[]))}.must_raise Sequel::Error
+    proc{@candidates.relational_divide(@associations, @requirements, :candidate_keys=>[[:id, :person_id]], :requirement_keys=>[[:a, :b], [:c, :d]])}.must_raise Sequel::Error
+  end
+end
+
 describe "Dataset#where" do
   before do
     @dataset = Sequel.mock[:test]

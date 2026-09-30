@@ -424,6 +424,87 @@ describe "Simple Dataset operations" do
   end if ENV['SEQUEL_ASYNC_THREAD_POOL']
 end
 
+describe "Dataset relational division" do
+  before do
+    @db = DB
+    @db.create_table!(:division_people) do
+      Integer :id, :primary_key=>true
+      Integer :kind
+    end
+    @db.create_table!(:division_qualifications) do
+      Integer :person_id
+      String :skill_name
+      Integer :kind
+    end
+    @db.create_table!(:division_required_skills) do
+      String :skill_name
+      Integer :kind
+    end
+
+    [[1, 10], [2, 10], [3, nil], [4, 10], [5, 10], [6, 10]].each do |id, kind|
+      @db[:division_people].insert(:id=>id, :kind=>kind)
+    end
+    [
+      [1, "a", 10], [1, "a", 10], [1, "b", 10],
+      [2, "a", 10], [2, "b", 10], [2, "c", 10],
+      [3, "a", nil],
+      [4, nil, nil],
+    ].each do |person_id, skill_name, kind|
+      @db[:division_qualifications].insert(:person_id=>person_id, :skill_name=>skill_name, :kind=>kind)
+    end
+    @db[:division_required_skills].multi_insert([
+      {:skill_name=>"a", :kind=>10},
+      {:skill_name=>"b", :kind=>10},
+    ])
+
+    @candidates = @db[:division_people]
+    @associations = @db[:division_qualifications]
+    @requirements = @db[:division_required_skills]
+    @opts = {
+      :candidate_keys=>[[:id, :person_id], [:kind, :kind]],
+      :requirement_keys=>[[:skill_name, :skill_name], [:kind, :kind]],
+    }
+  end
+
+  after do
+    @db.drop_table?(:division_people, :division_qualifications, :division_required_skills)
+  end
+
+  it "supports containment and exact division with duplicate association rows" do
+    @candidates.relational_divide(@associations, @requirements, @opts).order(:id).map(:id).must_equal [1, 2]
+    @candidates.relational_divide(@associations, @requirements, @opts.merge(:mode=>:exact)).order(:id).map(:id).must_equal [1]
+
+    duplicate_requirements = @requirements.union(@requirements, :from_self=>false)
+    @candidates.relational_divide(@associations, duplicate_requirements, @opts).order(:id).map(:id).must_equal [1, 2]
+  end
+
+  it "supports NULL matching in composite keys" do
+    @db[:division_required_skills].multi_insert([
+      {:skill_name=>"a", :kind=>nil},
+    ])
+
+    requirements = @db[:division_required_skills].where(:skill_name=>"a", :kind=>nil)
+    @candidates.relational_divide(@associations, requirements, @opts).order(:id).map(:id).must_equal []
+    @candidates.relational_divide(@associations, requirements, @opts.merge(:null_equality=>:equal)).order(:id).map(:id).must_equal [3]
+    @candidates.relational_divide(@associations, requirements, @opts.merge(:null_equality=>:equal, :mode=>:exact)).order(:id).map(:id).must_equal [3]
+  end
+
+  it "handles empty requirements and candidates without associations" do
+    empty_requirements = @requirements.where(false)
+
+    @candidates.relational_divide(@associations, empty_requirements, @opts).order(:id).map(:id).must_equal [1, 2, 3, 4, 5, 6]
+    @candidates.relational_divide(@associations, empty_requirements, @opts.merge(:mode=>:exact)).order(:id).map(:id).must_equal [3, 4, 5, 6]
+  end
+
+  it "supports bound variables in the component datasets" do
+    associations = @associations.where{person_id >= :$minimum_person_id}.bind(:minimum_person_id=>1)
+    requirements = @requirements.where(:skill_name=>:$skill_name)
+    ds = @candidates.relational_divide(associations, requirements, @opts)
+    ds.call(:select, :skill_name=>"a").map{|row| row[:id]}.sort.must_equal [1, 2]
+    ds.call(:select, :skill_name=>"b").map{|row| row[:id]}.sort.must_equal [1, 2]
+  end
+end
+
 describe "Simple dataset operations with nasty table names" do
   before do
     @db = DB

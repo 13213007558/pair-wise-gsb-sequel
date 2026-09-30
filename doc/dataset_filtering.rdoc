@@ -221,6 +221,22 @@ Datasets can be used as subqueries. Subqueries can be very useful for filtering 
 
 Note that if you are checking for the inclusion of a single column in a subselect, the subselect should only select a single column.
 
+== Relational division
+
+Use Dataset#relational_divide when you need candidates that have an entire group of associated rows. The candidate, association, and requirement inputs are all datasets, and the key mappings support composite keys:
+
+  people = DB[:people]
+  qualifications = DB[:person_qualifications]
+  requirements = DB[:required_skills].where(program: 'math')
+
+  people.relational_divide(qualifications, requirements,
+    candidate_keys: [[:id, :person_id]],
+    requirement_keys: [[:skill_name, :skill_name]])
+
+The default <tt>mode: :at_least</tt> returns candidates that contain every required key value, even if they have additional values. Use <tt>mode: :exact</tt> to reject candidates with additional values. Association keys are treated as a set, so duplicate association rows do not change the result.
+
+The default <tt>null_equality: :sql</tt> uses SQL equality, where NULL never equals NULL. Use <tt>null_equality: :equal</tt> to match rows where both sides of a key are NULL. With an empty requirement dataset, +:at_least+ returns all candidates, including those with no associations; +:exact+ returns only candidates with no associated key values.
+
 == Using OR instead of AND
 
 By default, if you chain calls to +where+, the conditions get ANDed together.  If you want to use an OR for a condition, you can use the +or+ method:
