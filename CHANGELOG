@@ -1,5 +1,7 @@
 === master
 
+* Add Dataset#divide for relational division with multi-column keys, contains and exact modes, and explicit NULL equality semantics (jeremyevans)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

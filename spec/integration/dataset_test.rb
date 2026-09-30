@@ -2418,3 +2418,87 @@ describe "MERGE" do
     @m1.all.must_equal []
   end
 end if DB.dataset.supports_merge? && DB.database_type != :oracle
+
+describe "Dataset relational division" do
+  before do
+    DB.create_table!(:division_people) { Integer :id; String :name }
+    DB.create_table!(:division_required_skills) { Integer :kind; Integer :level }
+    DB.create_table!(:division_person_skills) { Integer :person_id; Integer :kind; Integer :level }
+    DB[:division_people].multi_insert([
+      {id: 1, name: "all"},
+      {id: 2, name: "extra"},
+      {id: 3, name: "missing"},
+      {id: 4, name: "none"},
+      {id: 5, name: "all duplicate"},
+      {id: 6, name: "no associations"}
+    ])
+    DB[:division_required_skills].multi_insert([
+      {kind: 1, level: 10},
+      {kind: 2, level: nil},
+      {kind: 2, level: nil}
+    ])
+    DB[:division_person_skills].multi_insert([
+      {person_id: 1, kind: 1, level: 10},
+      {person_id: 1, kind: 1, level: 10},
+      {person_id: 1, kind: 2, level: nil},
+      {person_id: 2, kind: 1, level: 10},
+      {person_id: 2, kind: 2, level: nil},
+      {person_id: 2, kind: 3, level: 20},
+      {person_id: 3, kind: 1, level: 10},
+      {person_id: 4, kind: nil, level: nil},
+      {person_id: 5, kind: 1, level: 10},
+      {person_id: 5, kind: 1, level: 10},
+      {person_id: 5, kind: 2, level: nil}
+    ])
+    @people = DB[:division_people].order(:id)
+    @associations = DB[:division_person_skills]
+    @requirements = DB[:division_required_skills].select(:kind, :level)
+    @opts = {
+      candidate_keys: :id,
+      association_keys: [:person_id, :kind, :level],
+      requirement_keys: [:kind, :level]
+    }
+  end
+
+  after do
+    DB.drop_table?(:division_person_skills, :division_required_skills, :division_people)
+  end
+
+  it "supports contains and exact modes with composite keys, duplicate rows, and null-safe equality" do
+    @people.divide(@associations, @requirements, @opts.merge(null_equality: true)).map(:id).must_equal [1, 2, 5]
+    @people.divide(@associations, @requirements, @opts.merge(null_equality: true, mode: :exact)).map(:id).must_equal [1, 5]
+    @people.where(id: 2).divide(@associations, @requirements, @opts.merge(null_equality: true, mode: :exact)).must_be_empty
+  end
+
+  it "follows SQL equality for NULL by default" do
+    @people.divide(@associations, @requirements, @opts).must_be_empty
+  end
+
+  it "does not match NULL values with non-null values under SQL equality" do
+    DB[:division_person_skills].where(person_id: 1, kind: 2).update(level: 20)
+    @people.divide(@associations, @requirements, @opts).must_be_empty
+  end
+
+  it "matches NULL composite-key components with SQL semantics unless null-safe equality is requested" do
+    DB[:division_required_skills].delete
+    DB[:division_required_skills].insert(kind: 2, level: nil)
+    @people.divide(@associations, @requirements, @opts).must_be_empty
+    @people.divide(@associations, @requirements, @opts.merge(null_equality: true)).map(:id).must_equal [1, 2, 5]
+  end
+
+  it "handles candidates with no association rows and empty requirement datasets" do
+    empty_requirements = DB[:division_required_skills].where(kind: -1).select(:kind, :level)
+    @people.divide(@associations, empty_requirements, @opts).map(:id).must_equal [1, 2, 3, 4, 5, 6]
+    @people.divide(@associations, empty_requirements, @opts.merge(mode: :exact, null_equality: true)).map(:id).must_equal [6]
+  end
+
+  it "preserves filters, aliases, and bind variables" do
+    people = @people.where(id: :$person_id).bind(person_id: 1)
+    associations = @associations.where(Sequel[:person_id] => :$association_person_id).bind(association_person_id: 1)
+    requirements = @requirements.where(Sequel[:kind] => :$required_kind).bind(required_kind: 1)
+    divided = people.divide(associations, requirements, @opts.merge(null_equality: true, alias: :people))
+    divided.sql.must_include "AS 'people'"
+    result = divided.where(Sequel[:people][:id] => :$selected_person_id).bind(selected_person_id: 1).call(:all)
+    result.map { |row| row[:id] }.must_equal [1]
+  end
+end

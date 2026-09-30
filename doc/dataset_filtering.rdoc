@@ -221,6 +221,40 @@ Datasets can be used as subqueries. Subqueries can be very useful for filtering 
 
 Note that if you are checking for the inclusion of a single column in a subselect, the subselect should only select a single column.
 
+== Filtering candidates by a required set of associated values
+
+Use +Dataset#divide+ for relational division, when a candidate must be related to an
+entire required set of values. The receiver is the candidate dataset, the first
+argument is the association dataset, and the second argument is the requirement
+dataset. All three can be arbitrary datasets.
+
+With the default +:contains+ mode, candidates may have additional associated
+values. With +:exact+, their distinct associated values must be exactly the
+required set:
+
+  people = DB[:people]
+  person_skills = DB[:person_skills]
+  required_skills = DB[:skills].where(required: true).select(:skill_id)
+
+  people.divide(person_skills, required_skills,
+    candidate_keys: :id,
+    association_keys: [:person_id, :skill_id])
+
+Multiple columns are specified as parallel arrays:
+
+  people.divide(person_skills, required_skills,
+    candidate_keys: [:tenant_id, :person_id],
+    association_keys: [:tenant_id, :person_id, :kind, :level],
+    requirement_keys: [:required_kind, :required_level],
+    mode: :exact)
+
+Duplicate association and requirement rows do not affect the result. Candidate
+rows retain the multiplicity they have in the candidate dataset. By default
+equality follows SQL semantics, so NULL never equals NULL. Pass
+<tt>null_equality: true</tt> to compare NULL values as equal. If the
+requirement dataset is empty, +:contains+ returns every candidate, while
+:exact+ returns candidates that have no associated key values.
+
 == Using OR instead of AND
 
 By default, if you chain calls to +where+, the conditions get ANDed together.  If you want to use an OR for a condition, you can use the +or+ method:

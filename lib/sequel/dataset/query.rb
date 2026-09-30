@@ -40,7 +40,7 @@ module Sequel
     
     # Methods that return modified datasets
     QUERY_METHODS = ((<<-METHS).split.map(&:to_sym) + JOIN_METHODS).freeze
-      add_graph_aliases distinct except exclude exclude_having
+      add_graph_aliases distinct divide except exclude exclude_having
       filter for_update from from_self graph grep group group_and_count group_append group_by having intersect invert
       limit lock_style naked offset or order order_append order_by order_more order_prepend qualify
       reverse reverse_order select select_all select_append select_group select_more select_prepend server
@@ -135,6 +135,139 @@ module Sequel
         raise(InvalidOperation, "DISTINCT ON not supported") unless supports_distinct_on?
         clone(:distinct => args.freeze)
       end
+    end
+
+    # Filter the receiver (the candidate dataset) using relational division.
+    # Rows from the association dataset determine which requirements each
+    # candidate satisfies.
+    #
+    # Options:
+    # :candidate_keys :: Columns or expressions in the candidate dataset that
+    #                   correspond to +:association_candidate_keys+.
+    # :association_keys :: Columns in the association dataset in candidate-key
+    #                      order followed by requirement-key order. Can be used
+    #                      instead of the two separate association key options.
+    # :association_candidate_keys :: Columns or expressions in the association
+    #                      dataset that correspond to +:candidate_keys+.
+    # :association_requirement_keys :: Columns or expressions in the
+    #                      association dataset whose values are divided against
+    #                      the requirement dataset.
+    # :requirement_keys :: Columns or expressions in the requirement dataset
+    #                      that correspond to +:association_requirement_keys+.
+    # Each plural key option also accepts the singular form (+:candidate_key+,
+    # +:association_key+, and +:requirement_key+).
+    # :mode :: +:contains+ (the default) returns candidates whose associated
+    #          values include every required value.  +:exact+ returns candidates
+    #          whose associated values are exactly the required values.
+    # :null_equality :: By default +false+, matching follows SQL equality where
+    #                   NULL never equals NULL.  Set to +true+ (or
+    #                   +:not_distinct+) to use null-safe equality, so NULL is
+    #                   considered equal to NULL. +:distinct+ is the same as
+    #                   the default.
+    # :alias :: Alias to use for the candidate derived table.
+    #
+    # Duplicate association and requirement rows do not affect the result,
+    # because the query tests for existence of matching key combinations.
+    # Candidate rows retain the row multiplicity of the receiver.
+    # With an empty requirement dataset, +:contains+ returns every candidate,
+    # while +:exact+ returns only candidates with no associated key combination.
+    #
+    #   DB[:people].divide(DB[:person_skills], DB[:required_skills],
+    #     candidate_keys: :id,
+    #     association_keys: [:person_id, :skill_id])
+    #
+    # Multiple keys are supported by using arrays:
+    #
+    #   candidates.divide(associations, requirements,
+    #     candidate_keys: [:tenant_id, :person_id],
+    #     association_candidate_keys: [:candidate_tenant_id, :person_id],
+    #     association_requirement_keys: [:skill_kind, :skill_level],
+    #     requirement_keys: [:required_kind, :required_level])
+    def divide(associations, requirements, opts=OPTS)
+      raise(Error, "associations must be a Dataset") unless associations.is_a?(Dataset)
+      raise(Error, "requirements must be a Dataset") unless requirements.is_a?(Dataset)
+      unless db.equal?(associations.db) && db.equal?(requirements.db)
+        raise(Error, "division datasets must all use the same Database")
+      end
+
+      mode = opts.fetch(:mode, :contains).to_sym
+      raise(Error, "invalid division mode: #{opts[:mode].inspect}") unless [:contains, :exact].include?(mode)
+
+      candidate_keys = division_option_keys(opts, :candidate_keys, :candidate_key)
+      requirement_keys = division_option_keys(opts, :requirement_keys, :requirement_key)
+      association_key_option = opts[:association_keys] || opts[:association_key]
+
+      if association_key_option
+        association_keys = Array(association_key_option)
+        if requirement_keys.empty?
+          association_candidate_keys = association_keys.first(candidate_keys.length)
+          association_requirement_keys = association_keys[candidate_keys.length..-1] || EMPTY_ARRAY
+          requirement_keys = association_requirement_keys
+        else
+          split_position = association_keys.length - requirement_keys.length
+          association_candidate_keys = association_keys.first(split_position)
+          association_requirement_keys = association_keys[split_position..-1] || EMPTY_ARRAY
+        end
+      else
+        association_candidate_keys = division_option_keys(opts, :association_candidate_keys, :candidate_keys, :candidate_key)
+        association_requirement_keys = division_option_keys(opts, :association_requirement_keys, :requirement_keys, :requirement_key)
+      end
+
+      raise(Error, "must provide at least one candidate key for division") if candidate_keys.empty?
+      raise(Error, "must provide at least one requirement key for division") if requirement_keys.empty?
+      unless candidate_keys.length == association_candidate_keys.length
+        raise(Error, "candidate and association candidate key arrays must have the same number of entries")
+      end
+      unless association_requirement_keys.length == requirement_keys.length
+        raise(Error, "association requirement and requirement key arrays must have the same number of entries")
+      end
+      if association_key_option && association_keys.length != candidate_keys.length + requirement_keys.length
+        raise(Error, "association_keys must contain candidate keys followed by requirement keys")
+      end
+
+      null_equality = case opts[:null_equality]
+      when nil, false, :distinct, "distinct"
+        false
+      when true, :not_distinct, "not_distinct"
+        true
+      else
+        raise(Error, "invalid null equality mode: #{opts[:null_equality].inspect}")
+      end
+      candidate_alias = opts[:alias] || unused_table_alias(:division_candidates)
+      requirement_alias = division_dataset_alias(requirements, :division_requirements, [candidate_alias])
+      association_alias = division_dataset_alias(associations, :division_associations, [candidate_alias, requirement_alias])
+
+      candidates = from_self(alias: candidate_alias)
+      association_dataset = associations.from_self(alias: association_alias)
+      requirement_dataset = requirements.from_self(alias: requirement_alias)
+
+      candidate_key_columns = candidate_keys.map{|key| qualified_expression(key, candidate_alias)}
+      association_candidate_key_columns = association_candidate_keys.map{|key| qualified_expression(key, association_alias)}
+      association_requirement_key_columns = association_requirement_keys.map{|key| qualified_expression(key, association_alias)}
+      requirement_key_columns = requirement_keys.map{|key| qualified_expression(key, requirement_alias)}
+
+      bind_vars = division_bind_vars(requirements, associations)
+
+      missing_requirement = requirement_dataset.where(
+        ~association_dataset.where(
+          division_key_conditions(candidate_key_columns, association_candidate_key_columns, null_equality).
+            & division_key_conditions(association_requirement_key_columns, requirement_key_columns, null_equality)
+        ).exists
+      ).exists
+
+      result = candidates.where(~missing_requirement)
+      result = result.clone(:bind_vars=>bind_vars) unless bind_vars.empty?
+      if mode == :exact
+        extra_association = association_dataset.where(
+          division_key_conditions(candidate_key_columns, association_candidate_key_columns, null_equality)
+        ).where(
+          ~requirement_dataset.where(
+            division_key_conditions(association_requirement_key_columns, requirement_key_columns, null_equality)
+          ).exists
+        ).exists
+        result = result.where(~extra_association)
+      end
+      result
     end
 
     # Adds an EXCEPT clause using a second dataset object.
@@ -1569,6 +1702,48 @@ module Sequel
           columns << v
         end
       end
+    end
+
+    # Build the ANDed key comparison used by Dataset#divide.
+    def division_key_conditions(left_keys, right_keys, null_equality)
+      pairs = left_keys.zip(right_keys).map do |left_key, right_key|
+        if null_equality
+          equality = SQL::BooleanExpression.new(:'=', left_key, right_key)
+          both_null = SQL::BooleanExpression.new(:AND,
+            SQL::BooleanExpression.new(:IS, left_key, nil),
+            SQL::BooleanExpression.new(:IS, right_key, nil))
+          SQL::BooleanExpression.new(:OR, equality, both_null)
+        else
+          SQL::BooleanExpression.new(:'=', left_key, right_key)
+        end
+      end
+      SQL::BooleanExpression.new(:AND, *pairs)
+    end
+
+    # Read a division key option, optionally falling back to an alias option.
+    def division_option_keys(opts, *keys)
+      value = keys.map{|key| opts[key]}.compact.first
+      Array(value)
+    end
+
+    # Choose a derived-table alias for a dataset that may not have a FROM table.
+    def division_dataset_alias(dataset, base_alias, used_aliases)
+      if dataset.opts[:from]
+        dataset.unused_table_alias(base_alias, used_aliases)
+      elsif used_aliases.include?(base_alias)
+        dataset.unused_table_alias(base_alias, used_aliases)
+      else
+        base_alias
+      end
+    end
+
+    # Combine bind variables from the receiver and division subqueries.
+    def division_bind_vars(*datasets)
+      bind_vars = opts[:bind_vars] ? opts[:bind_vars].dup : {}
+      datasets.each do |dataset|
+        bind_vars.merge!(dataset.opts[:bind_vars]) if dataset.opts[:bind_vars]
+      end
+      bind_vars.freeze
     end
   end
 end

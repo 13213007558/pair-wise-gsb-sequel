@@ -363,6 +363,81 @@ describe "Dataset#exists" do
   end
 end
 
+describe "Dataset#divide" do
+  before do
+    @db = Sequel.mock
+    @candidates = @db[:people]
+    @associations = @db[:person_skills]
+    @requirements = @db[:required_skills].select(:skill_id)
+    @opts = {
+      candidate_keys: :id,
+      association_keys: [:person_id, :skill_id]
+    }
+  end
+
+  it "should return candidates containing requirements using correlated NOT EXISTS" do
+    @candidates.divide(@associations, @requirements, @opts).sql.must_equal(
+      "SELECT * FROM (SELECT * FROM people) AS division_candidates WHERE NOT (EXISTS (SELECT * FROM (SELECT skill_id FROM required_skills) AS division_requirements WHERE NOT (EXISTS (SELECT * FROM (SELECT * FROM person_skills) AS division_associations WHERE ((division_candidates.id = division_associations.person_id) AND (division_associations.skill_id = division_requirements.skill_id))))))"
+    )
+  end
+
+  it "should support exact division with an additional NOT EXISTS for extra associations" do
+    @candidates.divide(@associations, @requirements, @opts.merge(mode: :exact)).sql.must_equal(
+      "SELECT * FROM (SELECT * FROM people) AS division_candidates WHERE (NOT (EXISTS (SELECT * FROM (SELECT skill_id FROM required_skills) AS division_requirements WHERE NOT (EXISTS (SELECT * FROM (SELECT * FROM person_skills) AS division_associations WHERE ((division_candidates.id = division_associations.person_id) AND (division_associations.skill_id = division_requirements.skill_id)))))) AND NOT (EXISTS (SELECT * FROM (SELECT * FROM person_skills) AS division_associations WHERE ((division_candidates.id = division_associations.person_id) AND NOT (EXISTS (SELECT * FROM (SELECT skill_id FROM required_skills) AS division_requirements WHERE ((division_associations.skill_id = division_requirements.skill_id))))))))"
+    )
+  end
+
+  it "should use portable null-safe equality when requested" do
+    sql = @candidates.divide(@associations, @requirements, @opts.merge(null_equality: true)).sql
+    sql.must_include "((division_candidates.id = division_associations.person_id) OR ((division_candidates.id IS NULL) AND (division_associations.person_id IS NULL)))"
+    sql.must_include "((division_associations.skill_id = division_requirements.skill_id) OR ((division_associations.skill_id IS NULL) AND (division_requirements.skill_id IS NULL)))"
+  end
+
+  it "should use the requested candidate alias" do
+    @candidates.divide(@associations, @requirements, @opts.merge(alias: :people_subset)).sql.must_include "AS people_subset"
+  end
+
+  it "should support multiple matching keys" do
+    requirements = @db[:required_skills].select(:kind, :level)
+    opts = {
+      candidate_keys: [:id, :group_id],
+      association_candidate_keys: [:person_id, :group_id],
+      association_requirement_keys: [:kind, :level],
+      requirement_keys: [:kind, :level]
+    }
+    @candidates.divide(@associations, requirements, opts).sql.must_include(
+      "((division_candidates.id = division_associations.person_id) AND (division_candidates.group_id = division_associations.group_id) AND (division_associations.kind = division_requirements.kind) AND (division_associations.level = division_requirements.level))"
+    )
+  end
+
+  it "should accept singular key options" do
+    opts = {
+      candidate_key: :id,
+      association_key: [:person_id, :skill_id],
+      requirement_key: :skill_id
+    }
+    @candidates.divide(@associations, @requirements, opts).sql.must_include "(division_candidates.id = division_associations.person_id)"
+  end
+
+  it "should not modify the receiver or input datasets" do
+    candidate_sql = @candidates.sql
+    association_sql = @associations.sql
+    requirement_sql = @requirements.sql
+    @candidates.divide(@associations, @requirements, @opts)
+    @candidates.sql.must_equal candidate_sql
+    @associations.sql.must_equal association_sql
+    @requirements.sql.must_equal requirement_sql
+  end
+
+  it "should raise for invalid datasets, modes, and mismatched keys" do
+    proc{@candidates.divide(@associations, :requirements, @opts)}.must_raise Sequel::Error
+    proc{@candidates.divide(:associations, @requirements, @opts)}.must_raise Sequel::Error
+    proc{@candidates.divide(@associations, @requirements, @opts.merge(mode: :subset))}.must_raise Sequel::Error
+    proc{@candidates.divide(@associations, @requirements, @opts.merge(candidate_keys: [:id, :kind]))}.must_raise Sequel::Error
+    proc{@candidates.divide(@associations, @requirements, candidate_keys: :id, association_keys: [:person_id], requirement_keys: :skill_id)}.must_raise Sequel::Error
+  end
+end
+
 describe "Dataset#where" do
   before do
     @dataset = Sequel.mock[:test]
