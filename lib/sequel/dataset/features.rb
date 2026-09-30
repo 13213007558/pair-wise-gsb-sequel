@@ -94,6 +94,12 @@ module Sequel
       supports_returning?(:insert)
     end
 
+    # The maximum number of bound variables supported in a single SQL statement.
+    # By default, no limit is enforced.
+    def max_bound_variables
+      nil
+    end
+
     # Whether the dataset supports the INTERSECT and EXCEPT compound operations, true by default.
     def supports_intersect_except?
       true

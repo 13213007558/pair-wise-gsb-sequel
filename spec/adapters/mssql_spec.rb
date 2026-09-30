@@ -378,6 +378,16 @@ describe "MSSQL::Dataset#import" do
     @ds.all.must_equal [{:x=>1, :y=>3}, {:x=>2, :y=>4}]
   end
 
+  it "#multi_insert should return primary keys for heterogeneous rows" do
+    @db.create_table!(:test){primary_key :x; Integer :y; Integer :z}
+    @ds.multi_insert([
+      {:y=>10},
+      {:y=>20, :z=>2},
+      {:y=>30}
+    ], :heterogeneous_rows=>true, :return=>:primary_key).must_equal [1, 2, 3]
+    @ds.order(:x).map([:y, :z]).must_equal [[10, nil], [20, 2], [30, nil]]
+  end
+
   it "should handle WITH statements" do
     @db.create_table!(:test){Integer :x; Integer :y}
     @db[:testx].with(:testx, @db[:test]).import([:x, :y], [[1, 2], [3, 4], [5, 6]], :slice => 2)

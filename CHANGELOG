@@ -1,5 +1,7 @@
 === master
 
+* Support :heterogeneous_rows option for Dataset#multi_insert, batching rows by column set, respecting bound variable limits, and using per-row inserts when returning primary keys or RETURNING data
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

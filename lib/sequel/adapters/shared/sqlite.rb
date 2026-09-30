@@ -874,6 +874,11 @@ module Sequel
         db.sqlite_version >= 32800 ? true : super
       end
 
+      # SQLite supports a maximum of 999 host parameters in a single statement.
+      def max_bound_variables
+        999
+      end
+
       private
       
       # Add aliases to symbols and identifiers to work around SQLite bug.

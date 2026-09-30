@@ -585,13 +585,31 @@ module Sequel
     #   # INSERT INTO table (x) VALUES (1)
     #   # INSERT INTO table (x) VALUES (2)
     #
-    # Be aware that all hashes should have the same keys if you use this calling method,
-    # otherwise some columns could be missed or set to null instead of to default
-    # values.
+    # Be aware that by default all hashes should have the same keys if you use
+    # this calling method, otherwise some columns could be missed or set to
+    # null instead of to default values. To support rows with different keys,
+    # use the <tt>heterogeneous_rows: true</tt> option:
+    #
+    #   DB[:table].multi_insert([
+    #     {name: 'a'},
+    #     {name: 'b', status: nil}
+    #   ], heterogeneous_rows: true)
+    #
+    # In this mode, columns absent from a row are omitted from the INSERT
+    # statement, so database defaults are used. Rows with the same columns are
+    # batched together when the adapter supports it, while rows with empty hashes
+    # are inserted with DEFAULT VALUES. When primary keys or RETURNING data are
+    # requested, rows are inserted separately so returned values can be matched
+    # reliably to the input rows.
     #
     # This respects the same options as #import.
+    #
+    # Options:
+    # :heterogeneous_rows :: Handle rows with different keys, as described above.
     def multi_insert(hashes, opts=OPTS)
       return if hashes.empty?
+      return _multi_insert_heterogeneous(hashes, opts) if opts[:heterogeneous_rows]
+
       columns = hashes.first.keys
       import(columns, hashes.map{|h| columns.map{|c| h[c]}}, opts)
     end
@@ -1120,6 +1138,106 @@ module Sequel
     end
 
     protected
+
+    def _multi_insert_heterogeneous(hashes, opts=OPTS)
+      ds = opts[:server] ? server(opts[:server]) : self
+      slice_size = opts.fetch(:commit_every, opts.fetch(:slice, ds.send(:default_import_slice)))
+      trans_opts = Hash[opts]
+      trans_opts[:server] = ds.opts[:server]
+      returning_rows = ds._multi_insert_requests_returning_rows?
+
+      rows = []
+      offset = 0
+      while offset < hashes.length
+        slice = slice_size ? hashes[offset, slice_size] : hashes[offset...hashes.length]
+        offset += slice.length
+
+        if returning_rows
+          ds._multi_insert_heterogeneous_transaction(slice, trans_opts) do
+            rows.concat(slice.map{|h| ds._multi_insert_returning_row(h)})
+          end
+        elsif opts[:return] == :primary_key
+          ds._multi_insert_heterogeneous_transaction(slice, trans_opts) do
+            rows.concat(slice.map{|h| ds._multi_insert_primary_key_row(h)})
+          end
+        else
+          statements = ds._multi_insert_heterogeneous_sql(slice, slice_size)
+          ds._multi_insert_heterogeneous_transaction(statements, trans_opts) do
+            statements.each{|statement| ds.send(:execute_dui, statement)}
+          end
+        end
+      end
+
+      rows
+    end
+
+    def _multi_insert_heterogeneous_sql(hashes, slice_size=default_import_slice)
+      statements = []
+      columns = nil
+      rows = []
+
+      flush = lambda do
+        next if columns.nil?
+
+        if columns.empty?
+          rows.length.times{statements << insert_sql({})}
+        else
+          statements.concat(multi_insert_sql(columns, rows))
+        end
+      end
+
+      hashes.each do |hash|
+        row_columns = hash.keys
+        unless columns.nil? || row_columns.eql?(columns)
+          flush.call
+          columns = nil
+          rows = []
+        end
+
+        columns ||= row_columns
+        rows << columns.map{|column| hash[column]}
+
+        max_rows = _multi_insert_max_rows(columns, slice_size)
+        if max_rows && rows.length >= max_rows
+          flush.call
+          columns = nil
+          rows = []
+        end
+      end
+
+      flush.call
+      statements
+    end
+
+    def _multi_insert_heterogeneous_transaction(values, trans_opts)
+      trans_opts = Hash[trans_opts]
+      trans_opts[:skip_transaction] = true if values.length <= 1
+      @db.transaction(trans_opts){yield}
+    end
+
+    def _multi_insert_max_rows(columns, slice_size=default_import_slice)
+      return if columns.empty?
+
+      if max_bound_variables
+        bound_rows = max_bound_variables / columns.length
+        raise(Error, 'multi_insert row has more columns than the database supports in a single statement') if bound_rows < 1
+        slice_size = bound_rows if slice_size.nil? || bound_rows < slice_size
+      end
+      slice_size
+    end
+
+    def _multi_insert_primary_key_row(hash)
+      insert(hash)
+    end
+
+    def _multi_insert_returning_row(hash)
+      row = insert(hash).first
+      row.length == 1 ? row.values.first : row
+    end
+
+    def _multi_insert_requests_returning_rows?
+      !!(opts[:returning] || opts[:output])
+    end
 
     # Internals of #import.  If primary key values are requested, use
     # separate insert commands for each row.  Otherwise, call #multi_insert_sql

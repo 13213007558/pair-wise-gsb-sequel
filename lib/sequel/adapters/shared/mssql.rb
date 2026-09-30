@@ -891,6 +891,15 @@ module Sequel
         end
       end
 
+      def _multi_insert_primary_key_row(hash)
+        if supports_insert_select?
+          row = output(nil, [SQL::QualifiedIdentifier.new(:inserted, first_primary_key)]).insert_select(hash)
+          row.is_a?(Hash) ? row.values.first : row
+        else
+          super
+        end
+      end
+
       # If the dataset using a order without a limit or offset or custom SQL, 
       # remove the order.  Compounds on Microsoft SQL Server have undefined
       # order unless the result is specifically ordered.  Applying the current

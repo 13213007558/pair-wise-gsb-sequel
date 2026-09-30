@@ -1220,12 +1220,57 @@ describe "Sequel::Dataset#import and #multi_insert" do
     @ids.import([:i], (1..1000).to_a.zip)
     @ids.select_order_map(:i).must_equal((1..1000).to_a)
   end
+
+  it "should use database defaults and preserve columns for heterogeneous rows" do
+    @db.create_table!(:heterogeneous_rows) do
+      primary_key :id
+      String :name, null: false, default: 'unnamed'
+      String :status, default: 'default'
+    end
+
+    @db[:heterogeneous_rows].multi_insert([
+      {},
+      {:name => 'a'},
+      {:name => 'b', :status => nil},
+      {:name => 'c'},
+      {}
+    ], :heterogeneous_rows=>true)
+
+    @db[:heterogeneous_rows].order(:id).map([:name, :status]).must_equal [
+      ['unnamed', 'default'],
+      ['a', 'default'],
+      ['b', nil],
+      ['c', 'default'],
+      ['unnamed', 'default']
+    ]
+  ensure
+    @db.drop_table?(:heterogeneous_rows)
+  end
+
+  it "should roll back all heterogeneous rows when one insert fails" do
+    @db.create_table!(:heterogeneous_rows) do
+      primary_key :id
+      String :name, null: false
+    end
+
+    proc do
+      @db[:heterogeneous_rows].multi_insert([
+        {:name => 'a'},
+        {},
+        {:name => 'b'}
+      ], :heterogeneous_rows=>true)
+    end.must_raise(Sequel::DatabaseError)
+
+    @db[:heterogeneous_rows].count.must_equal 0
+  ensure
+    @db.drop_table?(:heterogeneous_rows)
+  end
 end
 
 describe "Sequel::Dataset#import and #multi_insert :return=>:primary_key" do
   before do
     @db = DB
-    @db.create_table!(:imp){primary_key :id; Integer :i}
+    @db.create_table!(:imp){primary_key :id; Integer :i; String :name}
     @ds = @db[:imp]
     @ds = @ds.async if async?
   end
@@ -1249,6 +1294,28 @@ describe "Sequel::Dataset#import and #multi_insert :return=>:primary_key" do
     @ds.multi_insert([{:i=>10}, {:i=>20}, {:i=>30}], :return=>:primary_key, :slice=>2).must_equal [1, 2, 3]
     @ds.import([:i], [[40], [50], [60]], :return=>:primary_key, :slice=>2).must_equal [4, 5, 6]
     @ds.order(:id).map([:id, :i]).must_equal [[1, 10], [2, 20], [3, 30], [4, 40], [5, 50], [6, 60]]
+  end
+
+  it "should return primary key values in input order for heterogeneous rows" do
+    @ds.multi_insert([
+      {:i=>10},
+      {:i=>20, :name=>'b'},
+      {:i=>30}
+    ], :heterogeneous_rows=>true, :return=>:primary_key).must_equal [1, 2, 3]
+    @ds.order(:id).map([:id, :i, :name]).must_equal [
+      [1, 10, nil],
+      [2, 20, 'b'],
+      [3, 30, nil]
+    ]
+  end
+
+  it "should return RETURNING rows in input order for heterogeneous rows" do
+    rows = @ds.returning(:id, :i).multi_insert([
+      {:i=>10},
+      {:i=>20, :name=>'b'},
+      {:i=>30}
+    ], :heterogeneous_rows=>true)
+    rows.must_equal [{:id=>1, :i=>10}, {:id=>2, :i=>20}, {:id=>3, :i=>30}]
   end
 end
 
