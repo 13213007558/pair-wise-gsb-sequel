@@ -56,6 +56,7 @@ module Sequel
   module Postgres
     class PGMultiRange < DelegateClass(Array)
       include Sequel::SQL::AliasMethods
+      include PGRangeSetOperations
 
       # Converts strings into PGMultiRange instances.
       class Parser < StringScanner
@@ -78,7 +79,7 @@ module Sequel
               when '}'
                 break
               when ','
-                # nothing
+                skip(/\s*/)
               else
                 raise Sequel::Error, "invalid multirange separator: #{sep.inspect}"
               end
@@ -340,6 +341,23 @@ module Sequel
       # Allow automatic parameterization.
       def sequel_auto_param_type(ds)
         "::#{db_type}" if all?{|range| range.is_a?(Range) || ds.send(:auto_param_type, range)}
+      end
+
+      private
+
+      # The ranges represented by the multirange.  Arrays returned from
+      # PostgreSQL are already canonical, but user-created multiranges may
+      # contain ruby Ranges or ranges in arbitrary order, which the shared
+      # set operation code normalizes.
+      def _set_ranges
+        map do |range|
+          range.is_a?(PGRange) ? range : PGRange.from_range(range)
+        end
+      end
+
+      # The database type of the ranges that make up the multirange.
+      def _set_db_type
+        db_type.sub('multirange', 'range')
       end
     end
   end

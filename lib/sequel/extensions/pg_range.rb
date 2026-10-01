@@ -68,8 +68,392 @@
 
 module Sequel
   module Postgres
+    # The PGRangeSetOperations module provides Ruby-side set operations
+    # (union, intersection, difference, and complement within a bounding
+    # frame) for PGRange and PGMultiRange values, without sending SQL to
+    # the database.  Results are normalized into ordered, non-overlapping
+    # ranges that cannot be merged further.
+    #
+    # Discrete domains (Integer and Date) use the successor semantics of
+    # the domain (Integer#succ and Date#next).  All other domains are
+    # treated as continuous, and endpoints are never artificially advanced
+    # by one.
+    module PGRangeSetOperations
+      # Sentinel cut representing an unbounded lower boundary.
+      NEG_INFINITY = Object.new.freeze
+      # Sentinel cut representing an unbounded upper boundary.
+      POS_INFINITY = Object.new.freeze
+
+      # Union of the receiver with +other+.  Returns a PGRange when the
+      # normalized result is a single range, and a PGMultiRange when it
+      # consists of multiple disjoint ranges.
+      def union(other)
+        _range_set_op(:union, other)
+      end
+
+      # Intersection of the receiver with +other+.  The intersection of
+      # two ranges is always a single (possibly empty) range.
+      def intersection(other)
+        _range_set_op(:intersection, other)
+      end
+
+      # Difference of the receiver minus +other+.  Returns a PGRange when
+      # the normalized result is a single range, and a PGMultiRange when
+      # the result has a gap.
+      def difference(other)
+        _range_set_op(:difference, other)
+      end
+
+      # Complement of the receiver inside the given +frame+.  This is
+      # equivalent to +frame.difference(self)+.
+      def complement(frame)
+        ranges = PGRangeSetOperations.coerce_input(frame)
+        force = PGRangeSetOperations.multirange?(frame) || PGRangeSetOperations.multirange?(self)
+        db_type = frame.respond_to?(:db_type) ? frame.db_type : nil
+        db_type ||= _set_db_type
+        PGRangeSetOperations.combine(:difference, ranges, _set_ranges, PGRangeSetOperations.send(:range_type, db_type), force)
+      end
+
+      alias + union
+      alias * intersection
+      alias - difference
+
+      private
+
+      # The ranges represented by the receiver.  PGRange represents a
+      # single range; PGMultiRange overrides this.
+      def _set_ranges
+        [self]
+      end
+
+      # The database type to use for operation results.  PGMultiRange
+      # overrides this to return its multirange type.
+      def _set_db_type
+        self.db_type
+      end
+
+      # Perform a set operation, normalizing both operands first.
+      def _range_set_op(operation, other)
+        ranges = PGRangeSetOperations.coerce_input(other)
+        force = PGRangeSetOperations.multirange?(self) || PGRangeSetOperations.multirange?(other)
+        PGRangeSetOperations.combine(operation, _set_ranges, ranges, _set_db_type, force)
+      end
+
+      class << self
+        # Convert an operand into an array of non-frozen PGRange values.
+        # Accepts PGRange, ruby Range, PGMultiRange, and arrays containing
+        # a mix of those objects.
+        def coerce_input(value)
+          case value
+          when PGRange
+            [value]
+          when Range
+            [PGRange.from_range(value)]
+          when Array
+            value.flat_map{|v| coerce_input(v)}
+          else
+            if multirange?(value)
+              value.to_a
+            else
+              raise(InvalidValue, "invalid value for range set operation: #{value.inspect}")
+            end
+          end
+        end
+
+        # Whether the value is a PGMultiRange (without requiring the
+        # pg_multirange extension to be loaded).
+        def multirange?(value)
+          defined?(::Sequel::Postgres::PGMultiRange) && value.is_a?(::Sequel::Postgres::PGMultiRange)
+        end
+
+        # Normalize the operands and perform the requested set operation.
+        def combine(operation, left, right, db_type, force_multi)
+          left = Kernel.send(:Array, left).reject(&:empty?)
+          right = Kernel.send(:Array, right).reject(&:empty?)
+
+          discrete = discrete_kind(left + right)
+          assert_orderable(left + right, discrete)
+
+          left_pieces = merge_pieces(left.map{|r| to_piece(r, discrete)}.select{|l, u| cut_cmp(l, u) < 0})
+          right_pieces = merge_pieces(right.map{|r| to_piece(r, discrete)}.select{|l, u| cut_cmp(l, u) < 0})
+
+          pieces = case operation
+          when :union
+            merge_pieces(left_pieces + right_pieces)
+          when :intersection
+            intersect_pieces(left_pieces, right_pieces)
+          when :difference
+            subtract_pieces(left_pieces, right_pieces)
+          else
+            raise(Error, "unknown range set operation: #{operation.inspect}")
+          end
+
+          build_result(pieces, discrete, db_type, force_multi)
+        end
+
+        private
+
+        # Determine whether the endpoint domain is discrete.  Integer and
+        # Date endpoints are discrete; everything else is continuous.
+        # Mixed discrete and continuous (or incompatible discrete) types
+        # are rejected.
+        def discrete_kind(ranges)
+          kinds = ranges.flat_map{|r| [r.begin, r.end]}.compact.map do |v|
+            case v
+            when Integer
+              :integer
+            when DateTime
+              :continuous
+            when Date
+              :date
+            else
+              :continuous
+            end
+          end.uniq
+
+          return nil if kinds.empty?
+          return :integer if kinds == [:integer]
+          return :date if kinds == [:date]
+          return nil if kinds == [:continuous]
+
+          raise(InvalidValue, "range set operations require compatible endpoint types, got: #{kinds.map(&:inspect).join(', ')}")
+        end
+
+        # Verify every pair of endpoints can be ordered using <=> in both
+        # directions.  Values whose comparison raises or returns nil are
+        # rejected with a clear error.
+        def assert_orderable(ranges, discrete)
+          values = ranges.flat_map{|r| [r.begin, r.end]}.compact.uniq
+          values.each do |v1|
+            values.each do |v2|
+              begin
+                c = v1 <=> v2
+              rescue => e
+                raise(InvalidValue, "cannot order range endpoints #{v1.inspect} and #{v2.inspect} (#{e.class}: #{e.message})")
+              end
+
+              unless c.is_a?(Integer)
+                raise(InvalidValue, "cannot order range endpoints #{v1.inspect} and #{v2.inspect}")
+              end
+
+              reverse = (v2 <=> v1) rescue nil
+              unless reverse.is_a?(Integer) && reverse == -c
+                raise(InvalidValue, "inconsistent ordering for range endpoints #{v1.inspect} and #{v2.inspect}")
+              end
+            end
+          end
+        end
+
+        # Convert a PGRange into a pair of cuts +[lower, upper]+.
+        #
+        # A cut sits between ordered domain values.  For continuous domains,
+        # the two cuts surrounding a value are identified by -1 (immediately
+        # before) and +1 (immediately after), which distinguishes a boundary
+        # included on one side from the same boundary excluded on the other.
+        #
+        # Discrete domains use the successor semantics of the domain: cuts
+        # are element positions, where the lower cut for an excluded
+        # beginning moves to the successor element, and the upper cut moves
+        # to the successor for an included ending.
+        def to_piece(range, discrete)
+          lower = if range.begin.nil?
+            [NEG_INFINITY, 0]
+          elsif discrete
+            v = range.begin
+            v = discrete_succ(v, discrete) if range.exclude_begin?
+            [v, 0]
+          else
+            [range.begin, range.exclude_begin? ? 1 : -1]
+          end
+
+          upper = if range.end.nil?
+            [POS_INFINITY, 0]
+          elsif discrete
+            v = range.exclude_end? ? range.end : discrete_succ(range.end, discrete)
+            [v, 0]
+          else
+            [range.end, range.exclude_end? ? -1 : 1]
+          end
+
+          [lower, upper]
+        end
+
+        # Successor value for discrete domains.
+        def discrete_succ(value, discrete)
+          case discrete
+          when :integer
+            value.succ
+          when :date
+            value.next
+          else
+            raise(Error, "unsupported discrete domain: #{discrete.inspect}")
+          end
+        end
+
+        # Compare two cuts.
+        def cut_cmp(a, b)
+          va, sa = a
+          vb, sb = b
+
+          if va.equal?(NEG_INFINITY)
+            return vb.equal?(NEG_INFINITY) ? 0 : -1
+          end
+          if va.equal?(POS_INFINITY)
+            return vb.equal?(POS_INFINITY) ? 0 : 1
+          end
+          return 1 if vb.equal?(NEG_INFINITY)
+          return -1 if vb.equal?(POS_INFINITY)
+
+          c = va <=> vb
+          return c unless c == 0
+          sa <=> sb
+        end
+
+        # Sort pieces and merge overlapping pieces.  Pieces are merged
+        # whenever their cuts coincide (which includes a continuous-domain
+        # boundary value shared as a single point).  Cuts that are merely
+        # neighboring in a discrete domain are not merged, because no
+        # boundary value is shared.
+        def merge_pieces(pieces)
+          sorted = pieces.sort do |(l1, u1), (l2, u2)|
+            c = cut_cmp(l1, l2)
+            c == 0 ? cut_cmp(u1, u2) : c
+          end
+
+          sorted.each_with_object([]) do |(l, u), merged|
+            if merged.empty? || cut_cmp(l, merged.last[1]) > 0
+              merged << [l, u]
+            elsif cut_cmp(u, merged.last[1]) > 0
+              merged.last[1] = u
+            end
+          end
+        end
+
+        # Intersection of two normalized piece lists.
+        def intersect_pieces(left, right)
+          pieces = []
+          i = 0
+          j = 0
+
+          while i < left.length && j < right.length
+            l1, u1 = left[i]
+            l2, u2 = right[j]
+
+            lower = cut_cmp(l1, l2) >= 0 ? l1 : l2
+            upper = cut_cmp(u1, u2) <= 0 ? u1 : u2
+
+            if cut_cmp(lower, upper) < 0
+              pieces << [lower, upper]
+            end
+
+            if cut_cmp(u1, u2) < 0
+              i += 1
+            else
+              j += 1
+            end
+          end
+
+          pieces
+        end
+
+        # Subtract every piece in +right+ from every piece in +left+.
+        def subtract_pieces(left, right)
+          left.flat_map do |l, u|
+            remaining = [[l, u]]
+
+            right.each do |l2, u2|
+              remaining = remaining.flat_map do |l1, u1|
+                result = []
+
+                if cut_cmp(l2, u1) == 1 || cut_cmp(u2, l1) == -1
+                  result << [l1, u1]
+                  next result
+                end
+
+                result << [l1, l2] if cut_cmp(l1, l2) < 0
+                result << [u2, u1] if cut_cmp(u2, u1) < 0
+                result
+              end
+            end
+
+            remaining
+          end
+        end
+
+        # Build the public result object from normalized pieces.
+        def build_result(pieces, discrete, db_type, force_multi)
+          if pieces.empty?
+            return PGRange.empty(db_type) unless force_multi
+            multirange_class.new([], multirange_type(db_type))
+          elsif pieces.length == 1 && !force_multi
+            piece_to_range(pieces.first, discrete, db_type)
+          else
+            ranges = pieces.map{|piece| piece_to_range(piece, discrete, db_type)}
+            multirange_class.new(ranges, multirange_type(db_type))
+          end
+        end
+
+        # Return the PGMultiRange class, or raise a clear error if the
+        # pg_multirange extension has not been loaded.
+        def multirange_class
+          unless defined?(::Sequel::Postgres::PGMultiRange)
+            raise(InvalidValue, "load the pg_multirange extension to represent range set operation results with multiple ranges")
+          end
+          ::Sequel::Postgres::PGMultiRange
+        end
+
+        # The multirange database type corresponding to a range type.
+        def multirange_type(db_type)
+          if db_type.nil?
+            raise(InvalidValue, "cannot produce a multirange result from ranges without a database type")
+          end
+
+          s = db_type.to_s
+          if s.end_with?('multirange')
+            s
+          else
+            s.sub(/range\z/, 'multirange')
+          end
+        end
+
+        # The range database type corresponding to a multirange type.
+        def range_type(db_type)
+          return nil if db_type.nil?
+          s = db_type.to_s
+          s.end_with?('multirange') ? s.sub('multirange', 'range') : s
+        end
+
+        # Convert a normalized piece back into a PGRange.  Discrete results
+        # are returned in the canonical half-open PostgreSQL form.
+        def piece_to_range(piece, discrete, db_type)
+          lower, upper = piece
+
+          beg, exclude_begin =
+            if lower[0].equal?(NEG_INFINITY)
+              [nil, false]
+            elsif discrete
+              [lower[0], false]
+            else
+              [lower[0], lower[1] == 1]
+            end
+
+          en, exclude_end =
+            if upper[0].equal?(POS_INFINITY)
+              [nil, false]
+            elsif discrete
+              [upper[0], true]
+            else
+              [upper[0], upper[1] == -1]
+            end
+
+          PGRange.new(beg, en, :exclude_begin=>exclude_begin, :exclude_end=>exclude_end, :db_type=>db_type)
+        end
+      end
+    end
+
     class PGRange
       include Sequel::SQL::AliasMethods
+      include PGRangeSetOperations
 
       # Creates callable objects that convert strings into PGRange instances.
       class Parser

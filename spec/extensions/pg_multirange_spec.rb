@@ -373,5 +373,107 @@ describe "pg_multirange extension" do
       (@MR.new([], 'int4range').eql? @MR.new([], 'int8range')).must_equal false
       (@MR.new([], 'int4range').eql? []).must_equal true
     end
+
+    describe "Ruby-side multirange set operations" do
+      before do
+        @m = @MR.new([@R.new(1, 3, :exclude_end=>true, :db_type=>'int4range'), @R.new(5, 7, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+      end
+
+      def point_set(value, min=-20, max=20)
+        (min..max).select{|i| value.cover?(i)}
+      end
+
+      it "should normalize unordered, overlapping, and adjacent member ranges" do
+        unordered = @MR.new([
+          @R.new(5, 7, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(1, 3, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(3, 5, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(0, 0, :db_type=>'int4range')
+        ], 'int4multirange')
+
+        unordered.union(@MR.new([], 'int4multirange')).must_equal @MR.new([
+          @R.new(0, 7, :exclude_end=>true, :db_type=>'int4range')
+        ], 'int4multirange')
+      end
+
+      it "should compute union, intersection, and difference against ranges by enumeration" do
+        ranges = [
+          @R.empty('int4range'),
+          @R.new(0, 1, :db_type=>'int4range'),
+          @R.new(2, 2, :db_type=>'int4range'),
+          @R.new(2, 6, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(3, 5, :db_type=>'int4range'),
+          @R.new(nil, nil, :db_type=>'int4range')
+        ]
+
+        ranges.each do |range|
+          ms = point_set(@m)
+          rs = point_set(range)
+
+          point_set(@m.union(range)).sort.must_equal((ms | rs).sort)
+          point_set(@m.intersection(range)).sort.must_equal((ms & rs).sort)
+          point_set(@m.difference(range)).sort.must_equal((ms - rs).sort)
+          @m.union(range).class.must_equal(@MR)
+          @m.intersection(range).class.must_equal(@MR)
+          @m.difference(range).class.must_equal(@MR)
+        end
+      end
+
+      it "should compute operations between multiranges and preserve multirange results" do
+        other = @MR.new([@R.new(2, 6, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+
+        @m.union(other).must_equal @MR.new([@R.new(1, 7, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+        @m.intersection(other).must_equal @MR.new([
+          @R.new(2, 3, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(5, 6, :exclude_end=>true, :db_type=>'int4range')
+        ], 'int4multirange')
+        @m.difference(other).must_equal @MR.new([
+          @R.new(1, 2, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(6, 7, :exclude_end=>true, :db_type=>'int4range')
+        ], 'int4multirange')
+      end
+
+      it "should support operator aliases" do
+        other = @MR.new([@R.new(2, 6, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+        (@m + other).must_equal @m.union(other)
+        (@m * other).must_equal @m.intersection(other)
+        (@m - other).must_equal @m.difference(other)
+      end
+
+      it "should complement multiranges inside a frame" do
+        frame = @R.new(0, 10, :db_type=>'int4range')
+        @m.complement(frame).must_equal @MR.new([
+          @R.new(0, 1, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(3, 5, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(7, 11, :exclude_end=>true, :db_type=>'int4range')
+        ], 'int4multirange')
+
+        multirange_frame = @MR.new([frame], 'int4multirange')
+        @m.complement(multirange_frame).must_equal @m.complement(frame)
+      end
+
+      it "should accept ruby Ranges and arrays as operands without mutating inputs" do
+        before = @m.to_a.map{|r| [r.begin, r.end, r.exclude_begin?, r.exclude_end?]}
+        @m.union(2...6)
+        @m.difference([3..4])
+        @m.intersection(1...7)
+        @m.to_a.map{|r| [r.begin, r.end, r.exclude_begin?, r.exclude_end?]}.must_equal before
+      end
+
+      it "should reject incompatible types, incomparable values, and non-range operands" do
+        proc{@m.union(@R.new(1.0, 2.0, :db_type=>'numrange'))}.must_raise Sequel::InvalidValue
+        proc{@m.union(42)}.must_raise Sequel::InvalidValue
+        value = Object.new
+        def value.<=>(other); nil; end
+        proc{@m.intersection(@R.new(value, value, :db_type=>'customrange'))}.must_raise Sequel::InvalidValue
+      end
+
+      it "should keep PostgreSQL literal round trips working" do
+        result = @m.union(@R.new(2, 6, :exclude_end=>true, :db_type=>'int4range'))
+        @db.literal(result).must_equal "int4multirange(int4range(1,7,'[)'))"
+        parsed = @db.conversion_procs[4451].call(result.unquoted_literal(@db))
+        parsed.must_equal result
+      end
+    end
   end
 end

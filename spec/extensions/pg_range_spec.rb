@@ -4,6 +4,7 @@ require_relative "spec_helper"
 describe "pg_range extension" do
   before(:all) do
     Sequel.extension :pg_array, :pg_range
+    Sequel.extension :pg_multirange
   end
 
   before do
@@ -628,6 +629,239 @@ describe "pg_range extension" do
 
    it "should have #valid_ruby_range return #{startless_range_support} for startless, endless ranges" do
       @R.new(nil, nil).valid_ruby_range?.must_equal(startless_range_support)
+    end
+  end
+
+  describe "Ruby-side range set operations" do
+    before do
+      @db.extension(:pg_multirange)
+      @MR = Sequel::Postgres::PGMultiRange
+    end
+
+    def point_set(range, min=-20, max=20)
+      (min..max).select{|i| range.cover?(i)}
+    end
+
+    def multi_point_set(multirange, min=-20, max=20)
+      (min..max).select{|i| multirange.cover?(i)}
+    end
+
+    def expect_canonical(result)
+      ranges = result.class == @MR ? result.to_a : [result]
+      result.class.must_equal(@MR) if ranges.length > 1
+      return result if ranges.length == 1 && ranges.first.empty?
+      ranges.each do |r|
+        r.wont_be :empty?
+      end
+      ranges.each_cons(2) do |r1, r2|
+        r1.end.must_be :<, r2.begin
+        r1.exclude_end?.must_equal true
+        r2.exclude_begin?.must_equal false
+      end
+      result
+    end
+
+    it "should compute union, intersection, and difference for small integer domains by enumeration" do
+      variants = [
+        [-5, -5], [-5, -2], [-2, 0], [0, 0], [0, 3], [1, 2],
+        [2, 2], [2, 5], [3, 7], [5, 5], [7, 10]
+      ].flat_map do |beg, en|
+        [
+          @R.new(beg, en, :exclude_begin=>false, :exclude_end=>false, :db_type=>'int4range'),
+          @R.new(beg, en, :exclude_begin=>false, :exclude_end=>true, :db_type=>'int4range'),
+          @R.new(beg, en, :exclude_begin=>true, :exclude_end=>false, :db_type=>'int4range'),
+          @R.new(beg, en, :exclude_begin=>true, :exclude_end=>true, :db_type=>'int4range')
+        ]
+      end
+
+      variants.each do |r1|
+        variants.each do |r2|
+          s1 = point_set(r1)
+          s2 = point_set(r2)
+
+          union = expect_canonical(r1.union(r2))
+          multi_point_set(union).sort.must_equal((s1 | s2).sort)
+          union.must_equal(r1 + r2)
+
+          intersection = r1.intersection(r2)
+          point_set(intersection).sort.must_equal((s1 & s2).sort)
+          intersection.must_equal(r1 * r2)
+
+          difference = expect_canonical(r1.difference(r2))
+          multi_point_set(difference).sort.must_equal((s1 - s2).sort)
+          difference.must_equal(r1 - r2)
+        end
+      end
+    end
+
+    it "should complement ranges inside a frame for small integer domains by enumeration" do
+      frames = [@R.new(-3, 8, :db_type=>'int4range'), @R.new(-3, 8, :exclude_end=>true, :db_type=>'int4range'), @R.new(nil, nil, :db_type=>'int4range')]
+      ranges = [
+        @R.empty('int4range'),
+        @R.new(-3, 8, :db_type=>'int4range'),
+        @R.new(-3, 8, :exclude_end=>true, :db_type=>'int4range'),
+        @R.new(0, 0, :db_type=>'int4range'),
+        @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range'),
+        @R.new(nil, 2, :exclude_end=>true, :db_type=>'int4range'),
+        @R.new(4, nil, :db_type=>'int4range')
+      ]
+
+      frames.each do |frame|
+        ranges.each do |range|
+          result = expect_canonical(range.complement(frame))
+          multi_point_set(result).sort.must_equal((point_set(frame) - point_set(range)).sort)
+        end
+      end
+    end
+
+    it "should normalize integer results to canonical half-open ranges and merge discrete neighbors" do
+      @R.new(1, 2, :db_type=>'int4range').union(@R.new(2, 3, :exclude_begin=>true, :db_type=>'int4range')).
+        must_equal(@R.new(1, 4, :exclude_end=>true, :db_type=>'int4range'))
+      gap = @R.new(1, 2, :exclude_end=>true, :db_type=>'int4range').union(@R.new(3, 4, :exclude_end=>true, :db_type=>'int4range'))
+      gap.class.must_equal @MR
+      gap.to_a.must_equal [
+        @R.new(1, 2, :exclude_end=>true, :db_type=>'int4range'),
+        @R.new(3, 4, :exclude_end=>true, :db_type=>'int4range')
+      ]
+      degenerate = @R.new(1, 2, :exclude_begin=>true, :exclude_end=>true, :db_type=>'int4range')
+      @R.empty('int4range').union(degenerate).must_equal @R.empty('int4range')
+    end
+
+    it "should handle date ranges using discrete date successor semantics" do
+      d1 = Date.new(2020, 1, 1)
+      d2 = Date.new(2020, 1, 4)
+      d3 = Date.new(2020, 1, 10)
+
+      @R.new(d1, d2, :db_type=>'daterange').union(@R.new(d2, d3, :exclude_begin=>true, :db_type=>'daterange')).
+        must_equal @R.new(d1, d3 + 1, :exclude_end=>true, :db_type=>'daterange')
+      @R.new(d1, d2, :exclude_end=>true, :db_type=>'daterange').union(@R.new(d2, d3, :exclude_end=>true, :db_type=>'daterange')).
+        must_equal @R.new(d1, d3, :exclude_end=>true, :db_type=>'daterange')
+      @R.new(d1, d2, :exclude_end=>true, :db_type=>'daterange').intersection(@R.new(d2, d3, :db_type=>'daterange')).
+        must_equal @R.empty('daterange')
+    end
+
+    it "should not merge continuous ranges that both exclude the shared boundary" do
+      left = @R.new(1.0, 2.0, :exclude_end=>true, :db_type=>'numrange')
+      right = @R.new(2.0, 3.0, :exclude_begin=>true, :db_type=>'numrange')
+
+      union = left.union(right)
+      union.class.must_equal @MR
+      union.to_a.must_equal [left, right]
+      left.intersection(right).must_equal @R.empty('numrange')
+    end
+
+    it "should intersect continuous ranges that share a single included boundary" do
+      left = @R.new(1.0, 2.0, :db_type=>'numrange')
+      right = @R.new(2.0, 3.0, :db_type=>'numrange')
+
+      left.intersection(right).must_equal @R.new(2.0, 2.0, :db_type=>'numrange')
+      left.union(right).must_equal @R.new(1.0, 3.0, :db_type=>'numrange')
+    end
+
+    it "should treat continuous values as continuous without advancing endpoints" do
+      left = @R.new(BigDecimal('1'), BigDecimal('2'), :db_type=>'numrange')
+      right = @R.new(BigDecimal('2'), BigDecimal('3'), :exclude_begin=>true, :db_type=>'numrange')
+
+      left.union(right).must_equal @R.new(BigDecimal('1'), BigDecimal('3'), :db_type=>'numrange')
+
+      gap_left = @R.new(BigDecimal('1'), BigDecimal('2'), :exclude_end=>true, :db_type=>'numrange')
+      gap_right = @R.new(BigDecimal('2'), BigDecimal('3'), :exclude_begin=>true, :db_type=>'numrange')
+      union = gap_left.union(gap_right)
+      union.class.must_equal @MR
+      union.to_a.must_equal [gap_left, gap_right]
+    end
+
+    it "should handle unbounded continuous and integer endpoints" do
+      universe = @R.new(nil, nil, :db_type=>'int4range')
+      middle = @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range')
+      complement = middle.complement(universe)
+      complement.to_a.must_equal [
+        @R.new(nil, 1, :exclude_end=>true, :db_type=>'int4range'),
+        @R.new(5, nil, :db_type=>'int4range')
+      ]
+
+      @R.new(nil, 2.0, :db_type=>'numrange').intersection(@R.new(2.0, nil, :db_type=>'numrange')).
+        must_equal @R.new(2.0, 2.0, :db_type=>'numrange')
+      @R.new(nil, 2.0, :exclude_end=>true, :db_type=>'numrange').intersection(@R.new(2.0, nil, :exclude_begin=>true, :db_type=>'numrange')).
+        must_equal @R.empty('numrange')
+    end
+
+    it "should handle empty ranges as set operation identities" do
+      range = @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range')
+      empty = @R.empty('int4range')
+
+      range.union(empty).must_equal range
+      empty.union(range).must_equal range
+      range.intersection(empty).must_equal empty
+      empty.intersection(range).must_equal empty
+      range.difference(empty).must_equal range
+      empty.difference(range).must_equal empty
+    end
+
+    it "should accept ruby Ranges and arrays of ranges" do
+      @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range').union(3...7).
+        must_equal @R.new(1, 7, :exclude_end=>true, :db_type=>'int4range')
+      @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range').union([7...9, 9...11]).
+        must_equal @MR.new([@R.new(1, 5, :exclude_end=>true, :db_type=>'int4range'), @R.new(7, 11, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+    end
+
+    it "should reject incompatible endpoint types" do
+      proc do
+        @R.new(1, 2, :db_type=>'int4range').union(@R.new(1.5, 2.5, :db_type=>'numrange'))
+      end.must_raise(Sequel::InvalidValue)
+      proc do
+        @R.new(Date.new(2020, 1, 1), Date.new(2020, 1, 2), :db_type=>'daterange').union(@R.new(1, 2, :db_type=>'int4range'))
+      end.must_raise(Sequel::InvalidValue)
+    end
+
+    it "should reject values whose comparator cannot determine order" do
+      value = Object.new
+      def value.<=>(other)
+        nil
+      end
+
+      proc do
+        @R.new(value, value, :db_type=>'customrange').union(@R.new(value, value, :db_type=>'customrange'))
+      end.must_raise(Sequel::InvalidValue)
+
+      raising = Object.new
+      def raising.<=>(other)
+        raise ArgumentError, 'cannot compare'
+      end
+      proc do
+        @R.new(raising, raising, :db_type=>'customrange').intersection(@R.new(raising, raising, :db_type=>'customrange'))
+      end.must_raise(Sequel::InvalidValue)
+    end
+
+    it "should reject operands that are not ranges or collections of ranges" do
+      proc{@R.new(1, 2, :db_type=>'int4range').union(42)}.must_raise(Sequel::InvalidValue)
+      proc{@R.new(1, 2, :db_type=>'int4range').complement(42)}.must_raise(Sequel::InvalidValue)
+    end
+
+    it "should not modify the input range objects" do
+      r1 = @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range')
+      r2 = @R.new(3, 7, :exclude_end=>true, :db_type=>'int4range')
+      before = [r1.begin, r1.end, r1.exclude_begin?, r1.exclude_end?, r2.begin, r2.end, r2.exclude_begin?, r2.exclude_end?]
+      r1.union(r2)
+      r1.intersection(r2)
+      r1.difference(r2)
+      r1.complement(@R.new(0, 10, :db_type=>'int4range'))
+      after = [r1.begin, r1.end, r1.exclude_begin?, r1.exclude_end?, r2.begin, r2.end, r2.exclude_begin?, r2.exclude_end?]
+      after.must_equal before
+    end
+
+    it "should keep PostgreSQL literal round trips working for operation results" do
+      range = @R.new(1, 5, :exclude_end=>true, :db_type=>'int4range').union(@R.new(3, 7, :exclude_end=>true, :db_type=>'int4range'))
+      literal = @db.literal(range)
+      literal.must_equal "int4range(1,7,'[)')"
+      parsed = @db.conversion_procs[3904].call(range.unquoted_literal(@db))
+      parsed.must_equal range
+
+      gap = @R.new(1.0, 2.0, :exclude_end=>true, :db_type=>'numrange').union(@R.new(2.0, 3.0, :exclude_begin=>true, :db_type=>'numrange'))
+      literal = @db.literal(gap)
+      literal.must_equal "nummultirange(numrange(1.0,2.0,'[)'), numrange(2.0,3.0,'(]'))"
+      parsed = @db.conversion_procs[4532].call(gap.unquoted_literal(@db))
+      parsed.must_equal gap
     end
   end
 end
