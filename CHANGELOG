@@ -1,5 +1,7 @@
 === master
 
+* Add keyset_pagination extension for cursor-based dataset pagination with typed, signed cursors (jeremyevans)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)
