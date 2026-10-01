@@ -131,6 +131,21 @@ module Sequel
     #            encryption and deserialization after decryption.  Can be either a
     #            symbol registered with the serialization plugin or an array of two
     #            callables, the first for serialization and the second for deserialization.
+    # :context :: An array of column symbols for row attributes that should be bound
+    #             to the encrypted data.  The table name, column name, and the names
+    #             and values of these attributes are unambiguously encoded and used as
+    #             additional authentication data when encrypting and decrypting, so
+    #             ciphertext copied to a different row, column, or table cannot be
+    #             decrypted.  This is only supported for non-searchable columns.
+    #             All context attributes must be set before the object is saved;
+    #             an error is raised before any SQL is issued if any are missing
+    #             (for this reason, do not bind to automatically generated primary
+    #             keys of new records).  See the "Context Binding" section below.
+    # :context_migration :: When used with the +:context+ option, allow decrypting
+    #             values that were encrypted before context binding was enabled
+    #             (the legacy format without a context), so that they can be
+    #             migrated to the context-bound format.  This should only be
+    #             enabled temporarily while migrating, and removed afterwards.
     #
     # The +column+ method also supports a block for column-specific keys:
     #
@@ -200,6 +215,49 @@ module Sequel
     # the same key id for a new key.  This approach allows for up to 256 concurrent keys
     # in the same configuration.
     #
+    # = Context Binding
+    #
+    # By default, the only authentication data used for the cipher comes from the key
+    # configuration, so ciphertext encrypted under a key can be copied to a different
+    # row (or table, or column) using the same key and still be decrypted.  With the
+    # +:context+ column option, the table name, column name, and the names and values
+    # of the given row attributes are unambiguously encoded (each part is length
+    # prefixed) and used as additional authentication data:
+    #
+    #   ConfidentialModel.plugin :column_encryption do |enc|
+    #     enc.column :encrypted_column_name, context: [:tenant_id]
+    #   end
+    #
+    # With this configuration, ciphertext copied to a row for a different tenant,
+    # or to a different column or table, will fail to decrypt.  Context binding is
+    # only supported for non-searchable encrypted columns.
+    #
+    # All context attributes must be known before the object is saved.  If any
+    # context attribute is not set when the column needs to be encrypted, an error
+    # is raised before any SQL is sent to the database.  The plugin does not try
+    # to guess values that are only known after the insert, such as automatically
+    # generated primary keys, so do not use such columns as context attributes.
+    #
+    # If a bound attribute is modified (for example, a record is reassigned to a
+    # different tenant), the encrypted column is automatically reencrypted with
+    # the new context when the object is saved, whether or not the column itself
+    # was modified.  This also works correctly if a save fails and is retried,
+    # and when rotating keys with +reencrypt+.
+    #
+    # Context-bound columns use a different ciphertext format than columns without
+    # context binding, and legacy ciphertext without a context is not accepted for
+    # them.  To migrate existing data, enable the +:context_migration+ option,
+    # which allows decrypting legacy values, and reencrypt all records:
+    #
+    #   ConfidentialModel.plugin :column_encryption do |enc|
+    #     enc.column :encrypted_column_name, context: [:tenant_id], context_migration: true
+    #   end
+    #   ConfidentialModel.needing_reencryption.all(&:reencrypt)
+    #
+    # After all records have been migrated, remove the +:context_migration+ option.
+    # Afterwards, only ciphertext in the context-bound format with a matching
+    # context is accepted.
+    #
     # = Encrypting Additional Formats
     #
     # By default, the column_encryption plugin assumes that the decrypted data should be
@@ -245,7 +303,8 @@ module Sequel
     #
     # column_value :: urlsafe_base64(flags + NUL + key_id + NUL + search_data + key_data +
     #                 cipher_iv + cipher_auth_tag + encrypted_data)
-    # flags :: 1 byte, the type of record (0: not searchable, 1: searchable, 2: lowercase searchable)
+    # flags :: 1 byte, the type of record (0: not searchable, 1: searchable,
+    #            2: lowercase searchable, 3: context-bound not searchable)
     # NUL :: 1 byte, ASCII NUL
     # key_id :: 1 byte, the key id, supporting 256 concurrently active keys (0 - 255)
     # search_data :: 0 bytes if flags is 0, 32 bytes if flags is 1 or 2.
@@ -276,6 +335,11 @@ module Sequel
     # The reason for the padding is so that a database administrator cannot be sure exactly how
     # many bytes are in the column.  It is stored encrypted because otherwise the database
     # administrator could calculate it by decoding the base64 data.
+    #
+    # For context-bound columns (flags 3), the authentication data used for the cipher is
+    # the key authentication data appended with the unambiguous encoding of the context
+    # (the table name, column name, and bound attribute names and values, with each part
+    # length prefixed), so the ciphertext can only be decrypted with the same context.
     #
     # = Unsupported Features
     #
@@ -349,6 +413,7 @@ module Sequel
         NOT_SEARCHABLE = 0
         SEARCHABLE = 1
         LOWERCASE_SEARCHABLE = 2
+        CONTEXT_NOT_SEARCHABLE = 3
 
         # This is the default padding, but up to 2x the padding can be used for a record.
         DEFAULT_PADDING = 8
@@ -372,7 +437,11 @@ module Sequel
         end
 
         # Decrypt using any supported format and any available key.
-        def decrypt(data)
+        # If a context is given, only data encrypted with a context is
+        # supported, and the context is used as additional authentication
+        # data.  If no context is given, only data encrypted without a
+        # context is supported.
+        def decrypt(data, context=nil)
           begin
             data = urlsafe_decode64(data)
           rescue ArgumentError
@@ -392,12 +461,30 @@ module Sequel
 
           case flags
           when NOT_SEARCHABLE
+            if context
+              raise Error, "Unable to decrypt encrypted column: data was not encrypted with a context"
+            end
+
+            if data.bytesize < 65
+              raise Error, "Decoded encrypted column smaller than minimum size"
+            end
+
+            data.slice!(0, 4)
+          when CONTEXT_NOT_SEARCHABLE
+            unless context
+              raise Error, "Unable to decrypt encrypted column: data was encrypted with a context"
+            end
+
             if data.bytesize < 65
               raise Error, "Decoded encrypted column smaller than minimum size"
             end
 
             data.slice!(0, 4)
           when SEARCHABLE, LOWERCASE_SEARCHABLE
+            if context
+              raise Error, "Unable to decrypt encrypted column: searchable data cannot be encrypted with a context"
+            end
+
             if data.bytesize < 97
               raise Error, "Decoded encrypted column smaller than minimum size"
             end
@@ -406,6 +493,8 @@ module Sequel
           else
             raise Error, "Unable to decode encrypted column: invalid flags"
           end
+
+          auth_data = "#{auth_data}#{context}" if context
 
           key_part = data.slice!(0, 32)
           cipher_iv = data.slice!(0, 12)
@@ -432,6 +521,25 @@ module Sequel
         # Encrypt in not searchable format with the first configured encryption key.
         def encrypt(data)
           _encrypt(data, "#{NOT_SEARCHABLE.chr}\0#{@key_id.chr}\0")
+        end
+
+        # Encrypt in context-bound not searchable format with the first configured
+        # encryption key.  The context is used as additional authentication data,
+        # so the same context must be provided when decrypting.
+        def encrypt_with_context(data, context)
+          _encrypt(data, "#{CONTEXT_NOT_SEARCHABLE.chr}\0#{@key_id.chr}\0", context)
+        end
+
+        # Whether the given encrypted data uses the context-bound format.
+        # Returns false for data that is not valid encrypted data.
+        def context_bound?(data)
+          begin
+            data = urlsafe_decode64(data)
+          rescue ArgumentError
+            return false
+          end
+
+          data.getbyte(0) == CONTEXT_NOT_SEARCHABLE && data.getbyte(1) == 0 && data.getbyte(3) == 0
         end
 
         # Encrypt in searchable format with the first configured encryption key.
@@ -506,15 +614,16 @@ module Sequel
           "#{search_type.chr}\0#{key_id.chr}\0#{OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, key, data)}"
         end
 
-        # Encrypt the data using AES-256-GCM, with the given prefix.
-        def _encrypt(data, prefix)
+        # Encrypt the data using AES-256-GCM, with the given prefix and
+        # optional context used as additional authentication data.
+        def _encrypt(data, prefix, context=nil)
           padding = @padding
           random_data = SecureRandom.random_bytes(32)
           cipher = OpenSSL::Cipher.new("aes-256-gcm")
           cipher.encrypt
           cipher.key = OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, @key, random_data)
           cipher_iv = cipher.random_iv
-          cipher.auth_data = @auth_data
+          cipher.auth_data = context ? "#{@auth_data}#{context}" : @auth_data
 
           cipher_text = String.new
           data_size = data.bytesize
@@ -610,9 +719,26 @@ module Sequel
         end
       end
 
-      # This stores four callables for handling encryption, decryption, data searching,
-      # and key searching.  One of these is created for each encrypted column.
-      ColumnEncryptionMetadata = Struct.new(:encryptor, :decryptor, :data_searcher, :key_searcher) # :nodoc:
+      # This stores callables for handling encryption, decryption, data searching,
+      # and key searching, as well as context binding information.  One of these
+      # is created for each encrypted column.  For columns without context binding,
+      # the encryptor and decryptor callables take a single argument (the data).
+      # For columns with context binding, they take two arguments (the model
+      # instance and the data), context_columns is a frozen array of bound
+      # attribute column symbols, and context_cryptor is the Cryptor used.
+      ColumnEncryptionMetadata = Struct.new(:encryptor, :decryptor, :data_searcher, :key_searcher, :context_columns, :context_cryptor) # :nodoc:
+
+      # Unambiguously encode the given context parts (the table name, column
+      # name, and bound attribute names and values) into a string for use as
+      # cipher authentication data, by length-prefixing each part.
+      def self.encode_context(parts)
+        str = String.new
+        parts.each do |part|
+          part = part.to_s
+          str << [part.bytesize].pack("N") << part
+        end
+        str
+      end
 
       module ClassMethods
         private
@@ -637,9 +763,28 @@ module Sequel
             column_encryption_cryptor
           end
 
+          if context_columns = opts[:context]
+            if opts[:searchable]
+              raise Error, ":context option is only supported for non-searchable encrypted columns"
+            end
+
+            context_columns = Array(context_columns)
+            unless context_columns.all?{|cc| cc.is_a?(Symbol)}
+              raise Error, "invalid :context option, must be an array of column symbols"
+            end
+
+            if context_columns.include?(column)
+              raise Error, "invalid :context option, cannot include the encrypted column itself"
+            end
+
+            context_columns = context_columns.freeze
+          elsif opts[:context_migration]
+            raise Error, ":context_migration option requires the :context option"
+          end
+
           encrypt_method, search_prefixes_method, search_type = case searchable = opts[:searchable]
           when nil, false
-            [:encrypt, nil, Cryptor::NOT_SEARCHABLE] 
+            [:encrypt, nil, context_columns ? Cryptor::CONTEXT_NOT_SEARCHABLE : Cryptor::NOT_SEARCHABLE] 
           when true
             [:searchable_encrypt, :search_prefixes, Cryptor::SEARCHABLE] 
           when :case_insensitive
@@ -653,10 +798,36 @@ module Sequel
           end
 
           # Setup the callables used in the metadata.
-          encryptor = cryptor.method(encrypt_method)
-          decryptor = cryptor.method(:decrypt)
-          data_searcher = cryptor.method(search_prefixes_method) if search_prefixes_method
-          key_searcher = lambda{cryptor.current_key_prefix(search_type)}
+          if context_columns
+            # Context-bound columns use instance-aware callables, so that the
+            # authentication context can be computed from the model instance.
+            allow_legacy = opts[:context_migration]
+            encryptor = lambda do |obj, data|
+              context = obj.send(:_column_encryption_current_context, column)
+              ciphertext = cryptor.encrypt_with_context(data, context)
+              obj.send(:_column_encryption_set_context, column, context)
+              ciphertext
+            end
+            decryptor = lambda do |obj, data|
+              if cryptor.context_bound?(data)
+                context = obj.send(:_column_encryption_ciphertext_context, column)
+                plaintext = cryptor.decrypt(data, context)
+                obj.send(:_column_encryption_set_context, column, context)
+                plaintext
+              elsif allow_legacy
+                cryptor.decrypt(data)
+              else
+                raise Error, "encrypted column #{column.inspect} is not in context-bound format; use the :context_migration option to support legacy data during migration"
+              end
+            end
+            data_searcher = nil
+            key_searcher = lambda{cryptor.current_key_prefix(search_type)}
+          else
+            encryptor = cryptor.method(encrypt_method)
+            decryptor = cryptor.method(:decrypt)
+            data_searcher = cryptor.method(search_prefixes_method) if search_prefixes_method
+            key_searcher = lambda{cryptor.current_key_prefix(search_type)}
+          end
 
           if format = opts[:format]
             if format.is_a?(Symbol)
@@ -669,22 +840,40 @@ module Sequel
             # callables to handle serialization and deserialization.
             serializer, deserializer = format
             enc, dec, data_s = encryptor, decryptor, data_searcher
-            encryptor = lambda do |data|
-              enc.call(serializer.call(data))
-            end
-            decryptor = lambda do |data|
-              deserializer.call(dec.call(data))
-            end
-            data_searcher = lambda do |data|
-              data_s.call(serializer.call(data))
+            if context_columns
+              encryptor = lambda do |obj, data|
+                enc.call(obj, serializer.call(data))
+              end
+              decryptor = lambda do |obj, data|
+                deserializer.call(dec.call(obj, data))
+              end
+            else
+              encryptor = lambda do |data|
+                enc.call(serializer.call(data))
+              end
+              decryptor = lambda do |data|
+                deserializer.call(dec.call(data))
+              end
+              data_searcher = lambda do |data|
+                data_s.call(serializer.call(data))
+              end
             end
           end
 
-          # Setup the setter and getter methods to do encryption and decryption using
-          # the serialization plugin.
-          serialize_attributes([encryptor, decryptor], column)
+          if context_columns
+            # Setup the setter and getter methods using the serialization plugin,
+            # with placeholder callables.  The actual encryption and decryption
+            # is handled by the serialize_value/deserialize_value overrides,
+            # which have access to the model instance to compute the context.
+            placeholder = lambda{|_| raise Error, "context-bound encrypted columns require the model instance for encryption and decryption"}
+            serialize_attributes([placeholder, placeholder], column)
+          else
+            # Setup the setter and getter methods to do encryption and decryption using
+            # the serialization plugin.
+            serialize_attributes([encryptor, decryptor], column)
+          end
 
-          column_encryption_metadata[column] = ColumnEncryptionMetadata.new(encryptor, decryptor, data_searcher, key_searcher).freeze
+          column_encryption_metadata[column] = ColumnEncryptionMetadata.new(encryptor, decryptor, data_searcher, key_searcher, context_columns, context_columns ? cryptor : nil).freeze
 
           nil
         end
@@ -711,11 +900,166 @@ module Sequel
           model.send(:column_encryption_metadata).each do |column, metadata|
             if (value = values[column]) && !value.start_with?(metadata.key_searcher.call)
               do_save = true
-              values[column] = metadata.encryptor.call(metadata.decryptor.call(value))
+              values[column] = if metadata.context_columns
+                metadata.encryptor.call(self, metadata.decryptor.call(self, value))
+              else
+                metadata.encryptor.call(metadata.decryptor.call(value))
+              end
             end
           end
 
           save if do_save
+        end
+
+        # Snapshot the authentication contexts of context-bound encrypted
+        # columns when initializing the object from the database, so later
+        # changes to bound attributes can be detected.
+        def initialize_from_db(values)
+          super
+          _column_encryption_snapshot_contexts
+          self
+        end
+
+        # Freeze the hash of context snapshots when freezing the object.
+        def freeze
+          column_encryption_contexts
+          super
+          @column_encryption_contexts.freeze
+          self
+        end
+
+        private
+
+        # A hash mapping context-bound encrypted columns to the authentication
+        # context matching the ciphertext currently stored in the column.
+        def column_encryption_contexts
+          @column_encryption_contexts ||= {}
+        end
+
+        # Snapshot the authentication contexts of context-bound encrypted
+        # columns when refreshing the object.
+        def _refresh_set_values(hash)
+          super
+          _column_encryption_snapshot_contexts
+        end
+
+        # Dup the context snapshots when duping the object.
+        def initialize_copy(other)
+          super
+          if (contexts = other.instance_variable_get(:@column_encryption_contexts))
+            @column_encryption_contexts = contexts.dup
+          end
+          self
+        end
+
+        # Encrypt context-bound columns using the current context computed
+        # from the object, instead of the placeholder callable registered
+        # with the serialization plugin.  Raises before any SQL is issued
+        # if a context attribute needed for encryption is not set.
+        def serialize_value(column, v)
+          if (meta = model.send(:column_encryption_metadata)[column]) && meta.context_columns
+            if v.nil?
+              column_encryption_contexts.delete(column)
+              nil
+            else
+              old_context = column_encryption_contexts[column]
+              ciphertext = meta.encryptor.call(self, v)
+              _column_encryption_mark_changed(column) if old_context && old_context != column_encryption_contexts[column]
+              ciphertext
+            end
+          else
+            super
+          end
+        end
+
+        # Decrypt context-bound columns using the context computed from the
+        # object, instead of the placeholder callable registered with the
+        # serialization plugin.
+        def deserialize_value(column, v)
+          if (meta = model.send(:column_encryption_metadata)[column]) && meta.context_columns
+            meta.decryptor.call(self, v) unless v.nil?
+          else
+            super
+          end
+        end
+
+        # Reencrypt stored ciphertext of context-bound columns whose context
+        # changed because a bound attribute (such as the tenant) was modified,
+        # for columns without a pending plaintext value.  Columns with a
+        # pending plaintext value are encrypted with the current context by
+        # serialize_value.
+        def serialize_deserialized_values
+          if (metadata = model.send(:column_encryption_metadata))
+            metadata.each do |column, meta|
+              next unless meta.context_columns
+              next if deserialized_values.has_key?(column)
+              next unless @values[column] && (old_context = column_encryption_contexts[column])
+
+              unless old_context == _column_encryption_current_context(column)
+                @values[column] = meta.encryptor.call(self, meta.decryptor.call(self, @values[column]))
+                _column_encryption_mark_changed(column)
+              end
+            end
+          end
+
+          super
+        end
+
+        # The authentication context for the given context-bound encrypted
+        # column, unambiguously encoded from the table name, column name, and
+        # current values of the bound attributes.  Raises if any bound
+        # attribute is not set.
+        def _column_encryption_current_context(column)
+          parts = [model.table_name.to_s, column.to_s]
+          model.send(:column_encryption_metadata)[column].context_columns.each do |cc|
+            v = @values[cc]
+            if v.nil?
+              raise Error, "cannot compute encryption context for encrypted column #{column.inspect}: context column #{cc.inspect} is not set"
+            end
+            parts << cc.to_s << v.to_s
+          end
+          ColumnEncryption.encode_context(parts)
+        end
+
+        # The context matching the ciphertext currently stored in the column,
+        # falling back to the current context if no snapshot is available.
+        def _column_encryption_ciphertext_context(column)
+          column_encryption_contexts[column] || _column_encryption_current_context(column)
+        end
+
+        # Record the context matching the ciphertext currently stored in the
+        # column.
+        def _column_encryption_set_context(column, context)
+          column_encryption_contexts[column] = context unless frozen?
+        end
+
+        # Mark the column as changed, so that reencrypted ciphertext is
+        # included when saving only changed columns.
+        def _column_encryption_mark_changed(column)
+          cc = _changed_columns
+          cc << column unless cc.include?(column)
+        end
+
+        # Snapshot the contexts of context-bound encrypted columns based on
+        # the current values, so that later changes to bound attributes can
+        # be detected and the ciphertext reencrypted before saving.
+        def _column_encryption_snapshot_contexts
+          if (metadata = model.send(:column_encryption_metadata))
+            contexts = column_encryption_contexts
+            metadata.each do |column, meta|
+              next unless meta.context_columns
+
+              if (ciphertext = @values[column]) && meta.context_cryptor.context_bound?(ciphertext)
+                begin
+                  contexts[column] = _column_encryption_current_context(column)
+                rescue Error
+                  contexts.delete(column)
+                end
+              else
+                contexts.delete(column)
+              end
+            end
+          end
         end
       end
 

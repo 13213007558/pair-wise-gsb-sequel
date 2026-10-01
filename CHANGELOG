@@ -1,5 +1,7 @@
 === master
 
+* Add :context and :context_migration options to column_encryption plugin for binding encrypted columns to the table, column, and row attributes (jeremyevans)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)
