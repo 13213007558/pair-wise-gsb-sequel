@@ -1,5 +1,7 @@
 === master
 
+* Add json_table extension for portable restricted JSON_TABLE support on PostgreSQL and SQLite (jeremyevans)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

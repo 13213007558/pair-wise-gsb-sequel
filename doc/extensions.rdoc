@@ -6,6 +6,17 @@ Sequel has an official extension system, for adding global, Database, and Datase
 
 Global extensions can add or modify the behavior of any part of Sequel.  Technically, they are not limited to affecting Sequel, as they can also modify code outside of Sequel (e.g. the blank extension).  However, extensions that modify things outside of Sequel generally do so only for backwards compatibility.
 
+=== JSON Table
+
+The +json_table+ extension offers a portable restricted subset of SQL/JSON's
++JSON_TABLE+ on PostgreSQL and SQLite.  Load it with:
+
+  Sequel.extension :json_table
+
+It supports scalar columns, +FOR ORDINALITY+, nested array paths, and per-column
++ON EMPTY+/+ON ERROR+ behavior.  SQLite expansion uses JSON1 table-valued
+functions entirely in SQL.
+
 Global extensions are loaded via <tt>Sequel.extension</tt>:
 
   Sequel.extension :named_timezones
