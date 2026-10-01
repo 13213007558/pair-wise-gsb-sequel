@@ -336,19 +336,32 @@ module Sequel
     # using the database support is probably a better approach.
     #
     # The column_encryption plugin is only supported on Ruby 2.3+ and when the Ruby openssl standard
-    # library supports the AES-256-GCM cipher.
-    module ColumnEncryption
-      # Cryptor handles the encryption and decryption of rows for a key set.
+  # library supports the AES-256-GCM cipher.
+  module ColumnEncryption
+    # Unambiguously encode an array of context strings into a single string,
+    # using a length-prefixed (netstring style) encoding, so that distinct
+    # context tuples always encode to distinct strings.
+    def self.encode_context(parts) # :nodoc:
+      s = String.new
+      parts.each do |part|
+        part = part.to_s.b
+        s << part.bytesize.to_s << ':' << part
+      end
+      s
+    end
+
+    # Cryptor handles the encryption and decryption of rows for a key set.
       # It also provides methods that return search prefixes, which datasets
       # use in queries.
       #
       # The same cryptor can support non-searchable, searchable, and case-insensitive
       # searchable columns.
       class Cryptor # :nodoc:
-        # Flags
-        NOT_SEARCHABLE = 0
-        SEARCHABLE = 1
-        LOWERCASE_SEARCHABLE = 2
+      # Flags
+      NOT_SEARCHABLE = 0
+      SEARCHABLE = 1
+      LOWERCASE_SEARCHABLE = 2
+      CONTEXT_BOUND = 3
 
         # This is the default padding, but up to 2x the padding can be used for a record.
         DEFAULT_PADDING = 8
@@ -371,8 +384,10 @@ module Sequel
           freeze
         end
 
-        # Decrypt using any supported format and any available key.
-        def decrypt(data)
+        # Decrypt using any supported format and any available key.  If the
+        # data was encrypted in the context-bound format, the context argument
+        # must be the encoded context suffix used during encryption.
+        def decrypt(data, context=nil)
           begin
             data = urlsafe_decode64(data)
           rescue ArgumentError
@@ -397,6 +412,17 @@ module Sequel
             end
 
             data.slice!(0, 4)
+          when CONTEXT_BOUND
+            unless context
+              raise Error, "Unable to decode encrypted column: context required"
+            end
+
+            if data.bytesize < 65
+              raise Error, "Decoded encrypted column smaller than minimum size"
+            end
+
+            data.slice!(0, 4)
+            auth_data = ColumnEncryption.encode_context([auth_data]) << context
           when SEARCHABLE, LOWERCASE_SEARCHABLE
             if data.bytesize < 97
               raise Error, "Decoded encrypted column smaller than minimum size"
@@ -432,6 +458,14 @@ module Sequel
         # Encrypt in not searchable format with the first configured encryption key.
         def encrypt(data)
           _encrypt(data, "#{NOT_SEARCHABLE.chr}\0#{@key_id.chr}\0")
+        end
+
+        # Encrypt in context-bound not searchable format with the first configured
+        # encryption key.  The context argument should be the encoded context suffix
+        # (table name, column name, and context attribute values), which is
+        # authenticated as part of the cipher authentication data.
+        def encrypt_with_context(data, context)
+          _encrypt(data, "#{CONTEXT_BOUND.chr}\0#{@key_id.chr}\0", ColumnEncryption.encode_context([@auth_data]) + context)
         end
 
         # Encrypt in searchable format with the first configured encryption key.
