@@ -269,7 +269,7 @@ module Sequel
 
     def_sql_method(self, :delete, %w'delete from where')
     def_sql_method(self, :insert, %w'insert into columns values')
-    def_sql_method(self, :select, %w'with select distinct columns from join where group having compounds order limit lock')
+    def_sql_method(self, :select, %w'with select distinct columns from join where group having qualify compounds order limit lock')
     def_sql_method(self, :update, %w'update table set where')
 
     WILDCARD = LiteralString.new('*').freeze
@@ -280,7 +280,7 @@ module Sequel
     BITWISE_METHOD_MAP = {:& =>:BITAND, :| => :BITOR, :^ => :BITXOR}.freeze
     COUNT_FROM_SELF_OPTS = [:distinct, :group, :sql, :limit, :offset, :compounds].freeze
     IS_LITERALS = {nil=>'NULL'.freeze, true=>'TRUE'.freeze, false=>'FALSE'.freeze}.freeze
-    QUALIFY_KEYS = [:select, :where, :having, :order, :group].freeze
+    QUALIFY_KEYS = [:select, :where, :having, :post_window_filter, :order, :group].freeze
 
     IS_OPERATORS = ::Sequel::SQL::ComplexExpression::IS_OPERATORS
     LIKE_OPERATORS = ::Sequel::SQL::ComplexExpression::LIKE_OPERATORS
@@ -1626,6 +1626,13 @@ module Sequel
         sql << " HAVING "
         literal_append(sql, having)
       end
+    end
+
+    def select_qualify_sql(sql)
+      return unless @opts[:post_window_filter] && supports_qualify_clause?
+
+      sql << " QUALIFY "
+      literal_append(sql, @opts[:post_window_filter])
     end
 
     def select_join_sql(sql)

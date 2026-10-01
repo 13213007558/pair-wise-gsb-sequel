@@ -4891,6 +4891,52 @@ describe "Dataset#window" do
   end
 end
 
+describe "Dataset#post_window_filter" do
+  before do
+    @db = Sequel.mock
+    @ds = @db[:test].with_extend do
+      def supports_qualify_clause?; true end
+      def supports_window_functions?; true end
+    end
+  end
+
+  it "filters after window functions using QUALIFY on supporting databases" do
+    rank = Sequel.function(:rank).over(partition: :department, order: Sequel.desc(:amount)).as(:rank)
+    @ds.select(:department, rank).post_window_filter(rank: 1..3).sql.must_equal \
+      "SELECT department, rank() OVER (PARTITION BY department ORDER BY amount DESC) AS rank FROM test QUALIFY ((rank >= 1) AND (rank <= 3))"
+  end
+
+  it "combines multiple post-window filters with AND" do
+    sql = @ds.post_window_filter(Sequel.function(:rank).over(partition: :group) => 1).
+      post_window_filter(Sequel.function(:sum, :amount).over(partition: :group) > 100).sql
+    sql.must_include "QUALIFY ((rank() OVER (PARTITION BY group) = 1) AND (sum(amount) OVER (PARTITION BY group) > 100))"
+  end
+
+  it "has a post_window_where alias" do
+    rank = Sequel.function(:rank).over(partition: :group).as(:rank)
+    @ds.select(:id, rank).post_window_where(rank: 1).sql.must_include "QUALIFY (rank = 1)"
+  end
+
+  it "does not modify the receiver" do
+    rank = Sequel.function(:rank).over(partition: :group).as(:rank)
+    original = @ds.select(:id, rank)
+    filtered = original.post_window_filter(rank: 1)
+    original.opts[:post_window_filter].must_be_nil
+    original.sql.must_equal "SELECT id, rank() OVER (PARTITION BY group) AS rank FROM test"
+    filtered.wont_be_same_as original
+    filtered.opts[:post_window_filter].wont_be_nil
+  end
+
+  it "is removed by unfiltered" do
+    filtered = @ds.where(id: 1).post_window_filter(rank: 1)
+    filtered.unfiltered.sql.must_equal "SELECT * FROM test"
+  end
+
+  it "is not supported when the database cannot use QUALIFY or emulate it" do
+    proc{Sequel.mock[:test].post_window_filter(rank: 1)}.must_raise Sequel::InvalidOperation
+  end
+end
+
 describe Sequel::SQL::Constants do
   before do
     @db = Sequel::Database.new

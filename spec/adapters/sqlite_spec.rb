@@ -484,6 +484,88 @@ describe "SQLite::Dataset#insert_conflict" do
   end
 end
 
+describe "SQLite post-window filters" do
+  before do
+    @db = Sequel.sqlite
+    @db.create_table :sales do
+      primary_key :id
+      String :region
+      Integer :amount
+      TrueClass :active
+    end
+    @db[:sales].multi_insert([
+      {region: 'east', amount: 100, active: true},
+      {region: 'east', amount: 80, active: true},
+      {region: 'east', amount: 50, active: false},
+      {region: 'west', amount: 200, active: true},
+      {region: 'west', amount: 40, active: true}
+    ])
+  end
+
+  it "filters multiple interleaved window calculations after WHERE" do
+    rank = Sequel.function(:rank).over(partition: :region, order: Sequel.desc(:amount)).as(:rank)
+    total = Sequel.function(:sum, :amount).over(partition: :region).as(:total)
+    ds = @db[:sales].
+      select(:id, :region, :amount, rank, total).
+      where(active: true).
+      post_window_filter(rank: 1..2).post_window_filter{Sequel[:total] > 150}.
+      order(:id)
+
+    ds.sql.wont_include "QUALIFY"
+    ds.sql.must_match(/WHERE \(`active` = 1\).+WHERE/m)
+    ds.all.must_equal [
+      {id: 1, region: 'east', amount: 100, rank: 1, total: 180},
+      {id: 2, region: 'east', amount: 80, rank: 2, total: 180},
+      {id: 4, region: 'west', amount: 200, rank: 1, total: 240},
+      {id: 5, region: 'west', amount: 40, rank: 2, total: 240}
+    ]
+  end
+
+  it "hides window expressions used only in the filter with SELECT *" do
+    rank_window = Sequel.function(:rank).over(partition: :region, order: Sequel.desc(:amount))
+    total_window = Sequel.function(:sum, :amount).over(partition: :region)
+    ds = @db[:sales].post_window_filter{(rank_window <= 2) & (total_window > 230)}
+
+    ds.sql.must_include "rank() OVER"
+    ds.sql.must_include "sum(`amount`) OVER"
+    ds.sql.wont_match(/SELECT \*.*WHERE.*SELECT \*/m)
+    ds.all.must_equal [
+      {id: 4, region: 'west', amount: 200, active: true},
+      {id: 5, region: 'west', amount: 40, active: true}
+    ]
+  end
+
+  it "keeps distinct, order, and limit on the query outside the derived filter" do
+    rank = Sequel.function(:rank).over(partition: :region, order: Sequel.desc(:amount)).as(:rank)
+    ds = @db[:sales].select(:region, rank).distinct.post_window_filter(rank: 1).order(:region).limit(1)
+
+    ds.sql.must_match(/DISTINCT .* FROM \(SELECT \* FROM \(.*\) AS .* WHERE.*\) AS .* ORDER BY .* LIMIT/m)
+    ds.all.must_equal [{region: 'east', rank: 1}]
+  end
+
+  it "supports window functions ordered by grouped aggregate aliases" do
+    row_number = Sequel.function(:row_number).over(order: Sequel.desc(:total))
+    ds = @db[:sales].
+      group(:region).
+      select(:region, Sequel.function(:sum, :amount).as(:total)).
+      post_window_filter{row_number <= 1}.
+      order(:region)
+
+    ds.all.must_equal [{region: 'west', total: 240}]
+  end
+
+  it "does not mutate the original dataset" do
+    rank = Sequel.function(:rank).over(partition: :region).as(:rank)
+    original = @db[:sales].select(:id, rank)
+    filtered = original.post_window_filter(rank: 1)
+
+    original.opts[:post_window_filter].must_be_nil
+    filtered.opts[:post_window_filter].wont_be_nil
+    original.sql.must_equal "SELECT `id`, rank() OVER (PARTITION BY `region`) AS 'rank' FROM `sales`"
+    filtered.sql.must_include "WHERE"
+  end
+end if DB.adapter_scheme == :sqlite
+
 describe "SQLite dataset" do
   before do
     DB.create_table! :test do

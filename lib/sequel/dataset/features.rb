@@ -217,6 +217,18 @@ module Sequel
     def supports_window_functions?
       false
     end
+
+    # Whether the dataset supports filtering rows after window functions
+    # have been calculated.
+    def supports_post_window_filter?
+      supports_qualify_clause?
+    end
+
+    # Whether the dataset supports the SQL QUALIFY clause for filtering after
+    # window functions have been calculated, false by default.
+    def supports_qualify_clause?
+      false
+    end
     
     # Whether the dataset supports the given window function option.  True by default.
     # This should only be called if supports_window_functions? is true. Possible options

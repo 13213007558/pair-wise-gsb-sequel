@@ -595,6 +595,9 @@ module Sequel
       Dataset.def_sql_method(self, :select, [['if opts[:values]', %w'with values compounds'], ['else', %w'with select distinct columns from join where group having window compounds order limit lock']])
       Dataset.def_sql_method(self, :update, [['if db.sqlite_version >= 33500', %w'with update table set from where returning'], ['elsif db.sqlite_version >= 33300', %w'with update table set from where'], ['elsif db.sqlite_version >= 30803', %w'with update table set where'], ["else", %w'update table set where']])
 
+      alias select_sql_without_post_window_filter select_sql
+      private :select_sql_without_post_window_filter
+
       def cast_sql_append(sql, expr, type)
         if type == Time or type == DateTime
           sql << "datetime("
@@ -726,6 +729,14 @@ module Sequel
         else
           super
         end
+      end
+
+      def select_sql
+        return select_sql_without_post_window_filter unless post_window_filter_emulation?
+
+        sql = @opts[:append_sql] || String.new
+        subselect_sql_append(sql, post_window_filter_emulation_dataset)
+        sql
       end
 
       # Handle uniqueness violations when inserting, by using a specified
@@ -868,6 +879,15 @@ module Sequel
       def supports_window_functions?
         db.sqlite_version >= 32600
       end
+
+      # SQLite does not support the QUALIFY clause.
+      def supports_qualify_clause?
+        false
+      end
+
+      def supports_post_window_filter?
+        supports_window_functions?
+      end
     
       # SQLite 3.28.0+ supports all window frame options that Sequel supports
       def supports_window_function_frame_option?(option)
@@ -875,6 +895,27 @@ module Sequel
       end
 
       private
+
+      def post_window_filter_emulation?
+        @opts[:post_window_filter] && !supports_qualify_clause? && supports_window_functions? && !@opts[:sql] && !@opts[:values]
+      end
+
+      def post_window_filter_emulation_dataset
+        inner_alias = unused_table_alias(:post_window_filter)
+        outer_alias = unused_table_alias(:post_window_filter, [inner_alias])
+        base_ds = clone(:post_window_filter=>nil, :order=>nil, :limit=>nil, :offset=>nil, :distinct=>nil, :lock=>nil, :append_sql=>nil)
+        result_columns = base_ds.columns
+        base_ds = base_ds.clone(:with=>nil)
+        base_ds = base_ds.from_self if @opts[:compounds]
+        transformer = PostWindowFilterTransformer.new(@opts[:post_window_filter], @opts[:select], result_columns, inner_alias, outer_alias)
+        inner_ds = base_ds.select(*transformer.inner_selects).from_self(:alias=>inner_alias)
+        outer_ds = inner_ds.where(transformer.condition).from_self(:alias=>outer_alias).select(*transformer.outer_selects)
+        outer_ds = outer_ds.clone(:with=>@opts[:with]) if @opts[:with]
+        outer_ds = outer_ds.distinct(*@opts[:distinct]) if @opts[:distinct]
+        outer_ds = outer_ds.order(*@opts[:order]) if @opts[:order]
+        outer_ds = outer_ds.limit(@opts[:limit], @opts[:offset]) if @opts[:limit] || @opts[:offset]
+        outer_ds
+      end
       
       # Add aliases to symbols and identifiers to work around SQLite bug.
       def _returning_values(values)
@@ -1068,6 +1109,150 @@ module Sequel
       def update_table_sql(sql)
         sql << ' '
         source_list_append(sql, @opts[:from][0..0])
+      end
+    end
+
+    class PostWindowFilterTransformer < ASTTransformer
+      attr_reader :condition
+
+      def initialize(condition, selects, columns, inner_alias, outer_alias)
+        @selects = selects
+        @outer_alias = outer_alias
+        @inner_alias = inner_alias
+        @columns = columns
+        @window_aliases = {}
+        @hidden_selects = []
+        @hidden_columns = []
+        @selected_expressions = {}
+        @transform_window_argument = false
+        @result_aliases = columns.dup
+
+        Array(selects).each(&method(:remember_selected_alias))
+
+        @condition = transform(condition)
+      end
+
+      def inner_selects
+        current_selects = Array(@selects).empty? ? [Dataset::WILDCARD] : @selects
+        current_selects + @hidden_selects
+      end
+
+      def outer_selects
+        @columns.map{|column| SQL::QualifiedIdentifier.new(@outer_alias, column)}
+      end
+
+      private
+
+      def v(object)
+        case object
+        when SQL::Function
+          if window_function?(object)
+            transformed_args, transformed_opts = begin
+              @transform_window_argument = true
+              [transform(object.args), object.opts.merge(:over=>transform_window(object.opts[:over]))]
+            ensure
+              @transform_window_argument = false
+            end
+            function = SQL::Function.new!(object.name, transformed_args, transformed_opts)
+            SQL::Identifier.new(window_alias(function))
+          else
+            super
+          end
+        when Symbol
+          _, column, symbol_alias = Sequel.split_symbol(object)
+          reference_alias = symbol_alias || column
+          if @transform_window_argument
+            object
+          else
+            add_hidden_column(SQL::Identifier.new(column), reference_alias, !symbol_alias.nil?)
+            SQL::QualifiedIdentifier.new(@inner_alias, reference_alias)
+          end
+        when SQL::Identifier
+          if @transform_window_argument
+            object
+          else
+            add_hidden_column(object, object.value)
+            SQL::QualifiedIdentifier.new(@inner_alias, object)
+          end
+        when SQL::QualifiedIdentifier
+          if @transform_window_argument
+            object
+          else
+            add_hidden_column(SQL::Identifier.new(object.column), object.column)
+            SQL::QualifiedIdentifier.new(@inner_alias, object.column)
+          end
+        else
+          super
+        end
+      end
+
+      def add_hidden_column(expression, column_alias, force_alias=false)
+        column_alias = column_alias.to_sym
+        return if @result_aliases.map(&:to_sym).include?(column_alias) || @hidden_columns.include?(column_alias)
+
+        @hidden_columns << column_alias
+        @hidden_selects << (force_alias ? expression.as(column_alias) : expression)
+      end
+
+      def remember_selected_alias(selected)
+        case selected
+        when SQL::AliasedExpression
+          @window_aliases[selected.expression] = selected.alias if window_function?(selected.expression)
+          @selected_expressions[selected.alias.to_sym] = selected.expression
+          @result_aliases << selected.alias
+        when Symbol
+          _, column, aliaz = Sequel.split_symbol(selected)
+          @result_aliases << (aliaz || column)
+        when SQL::Identifier
+          @result_aliases << selected.value
+        when SQL::QualifiedIdentifier
+          @result_aliases << selected.column
+        end
+      end
+
+      def window_function?(object)
+        object.is_a?(SQL::Function) && !object.opts[:over].nil?
+      end
+
+      def transform_window(window)
+        window_opts = window.opts.dup
+        begin
+          window_opts[:partition] = transform_selected_alias(window_opts[:partition]) if window_opts[:partition]
+          window_opts[:order] = transform_selected_alias(window_opts[:order]) if window_opts[:order]
+          SQL::Window.new(window_opts)
+        end
+      end
+
+      def transform_selected_alias(expression)
+        case expression
+        when SQL::Identifier, Symbol
+          _, column, aliaz = Sequel.split_symbol(expression) if expression.is_a?(Symbol)
+          column ||= expression.value if expression.respond_to?(:value)
+          selected_expression = @selected_expressions[(aliaz || column).to_sym]
+          selected_expression ? transform(selected_expression) : transform(expression)
+        when SQL::OrderedExpression
+          transformed = transform_selected_alias(expression.expression)
+          SQL::OrderedExpression.new(transformed, expression.descending, :nulls=>expression.nulls)
+        when Array
+          expression.map{|item| transform_selected_alias(item)}
+        else
+          transform(expression)
+        end
+      end
+
+      def window_alias(function)
+        @window_aliases[function] ||= begin
+          aliaz = unused_hidden_alias
+          @hidden_selects << function.as(aliaz)
+          aliaz
+        end
+      end
+
+      def unused_hidden_alias
+        used_aliases = @result_aliases.dup.concat(@window_aliases.values).concat(@hidden_columns).map(&:to_sym)
+        index = 0
+        index += 1 while used_aliases.include?((aliaz = :"_sequel_post_window_filter_#{index}"))
+        aliaz
       end
     end
   end

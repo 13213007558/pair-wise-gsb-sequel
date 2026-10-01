@@ -334,7 +334,7 @@ module Sequel
 
       include(Module.new do
         Sequel.set_temp_name(self){"Sequel::Oracle::DatasetMethods::_SQLMethods"}
-        Dataset.def_sql_method(self, :select, %w'with select distinct columns from join where group having compounds order limit lock')
+        Dataset.def_sql_method(self, :select, %w'with select distinct columns from join where group having qualify compounds order limit lock')
       end)
 
       def complex_expression_sql_append(sql, op, args)
@@ -532,6 +532,11 @@ module Sequel
       # Oracle supports window functions
       def supports_window_functions?
         true
+      end
+
+      # Oracle 23+ supports the QUALIFY clause.
+      def supports_qualify_clause?
+        server_version >= 23000000
       end
 
       # The version of the database server

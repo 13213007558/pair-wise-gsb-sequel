@@ -18,7 +18,7 @@ module Sequel
     #   # SELECT id, name FROM table WHERE active ORDER BY id
     class DatasetModule < ::Module
       meths = (<<-METHS).split.map(&:to_sym)
-        where exclude exclude_having having
+        where exclude exclude_having having post_window_filter post_window_where
         distinct grep group group_and_count group_append 
         limit offset order order_append order_prepend reverse 
         select select_all select_append select_group select_prepend server

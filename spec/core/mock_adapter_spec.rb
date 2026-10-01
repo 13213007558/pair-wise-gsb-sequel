@@ -1115,4 +1115,17 @@ describe "Oracle support" do
   it "should not support savepoints" do
     proc{@db.transaction{@db.transaction(:savepoint=>true){}}}.must_raise Sequel::InvalidOperation
   end
+
+  it "supports QUALIFY on Oracle 23+" do
+    rank = Sequel.function(:rank).over(partition: :group).as(:rank)
+    ds = @db[:test].select(:id, rank).with_extend{def server_version; 23000000 end}
+    ds.post_window_filter(rank: 1).sql.must_equal \
+      "SELECT \"ID\", rank() OVER (PARTITION BY \"GROUP\") \"RANK\" FROM \"TEST\" QUALIFY (\"RANK\" = 1)"
+  end
+
+  it "does not support QUALIFY before Oracle 23" do
+    rank = Sequel.function(:rank).over(partition: :group).as(:rank)
+    ds = @db[:test].select(:id, rank).with_extend{def server_version; 19000000 end}
+    proc{ds.post_window_filter(rank: 1)}.must_raise Sequel::InvalidOperation
+  end
 end

@@ -42,7 +42,7 @@ module Sequel
     QUERY_METHODS = ((<<-METHS).split.map(&:to_sym) + JOIN_METHODS).freeze
       add_graph_aliases distinct except exclude exclude_having
       filter for_update from from_self graph grep group group_and_count group_append group_by having intersect invert
-      limit lock_style naked offset or order order_append order_by order_more order_prepend qualify
+      limit lock_style naked offset or order order_append order_by order_more order_prepend post_window_filter post_window_where qualify
       reverse reverse_order select select_all select_append select_group select_more select_prepend server
       set_graph_aliases unfiltered ungraphed ungrouped union
       unlimited unordered where with with_recursive with_sql
@@ -432,6 +432,26 @@ module Sequel
     #   # SELECT * FROM items GROUP BY sum HAVING (sum = 10)
     def having(*cond, &block)
       add_filter(:having, cond, &block)
+    end
+
+    # Returns a copy of the dataset with a filter applied after window
+    # functions have been calculated.  On databases that support it, this
+    # uses an SQL QUALIFY clause.  On other databases, the filter is emulated
+    # using a derived table.  See #where for argument types.
+    #
+    #   DB[:items].select do
+    #     [department, Sequel.function(:rank).over(partition: :department, order: :salary.desc).as(:rank)]
+    #   end.post_window_filter(rank: 1)
+    #   # SELECT department, rank() OVER (PARTITION BY department ORDER BY salary DESC) AS rank
+    #   # FROM items QUALIFY rank = 1
+    def post_window_filter(*cond, &block)
+      raise(InvalidOperation, "Post-window filters are not supported on #{db.database_type}") unless supports_post_window_filter?
+      add_filter(:post_window_filter, cond, &block)
+    end
+
+    # Alias of #post_window_filter.
+    def post_window_where(*cond, &block)
+      post_window_filter(*cond, &block)
     end
     
     # Adds an INTERSECT clause using a second dataset object.
@@ -1031,8 +1051,8 @@ module Sequel
     #   DB[:items].group(:a).having(a: 1).where(:b).unfiltered
     #   # SELECT * FROM items GROUP BY a
     def unfiltered
-      return self unless opts[:where] || opts[:having]
-      cached_dataset(:_unfiltered_ds){clone(:where => nil, :having => nil)}
+      return self unless opts[:where] || opts[:having] || opts[:post_window_filter]
+      cached_dataset(:_unfiltered_ds){clone(:where => nil, :having => nil, :post_window_filter => nil)}
     end
 
     # Returns a copy of the dataset with no grouping (GROUP or HAVING clause) applied.
