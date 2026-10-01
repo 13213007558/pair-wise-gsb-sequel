@@ -373,5 +373,58 @@ describe "pg_multirange extension" do
       (@MR.new([], 'int4range').eql? @MR.new([], 'int8range')).must_equal false
       (@MR.new([], 'int4range').eql? []).must_equal true
     end
+
+    it "should support set operations returning normalized multiranges" do
+      r = lambda{|b, e, opts| @R.new(b, e, {:db_type=>'int4range'}.merge(opts))}
+      mr = @MR.new([r.call(1, 5, {}), r.call(10, 15, {})], 'int4multirange')
+
+      (mr | r.call(4, 11, {})).must_equal @MR.new([r.call(1, 15, {})], 'int4multirange')
+      (mr + r.call(4, 11, {})).must_equal @MR.new([r.call(1, 15, {})], 'int4multirange')
+      mr.union(r.call(4, 11, {})).must_equal @MR.new([r.call(1, 15, {})], 'int4multirange')
+
+      (mr & r.call(4, 11, {})).must_equal @MR.new([r.call(4, 5, {}), r.call(10, 11, {})], 'int4multirange')
+      mr.intersection(r.call(4, 11, {})).must_equal @MR.new([r.call(4, 5, {}), r.call(10, 11, {})], 'int4multirange')
+
+      (mr - r.call(4, 11, {})).must_equal @MR.new([r.call(1, 4, :exclude_end=>true), r.call(11, 15, :exclude_begin=>true)], 'int4multirange')
+      mr.difference(r.call(4, 11, {})).must_equal @MR.new([r.call(1, 4, :exclude_end=>true), r.call(11, 15, :exclude_begin=>true)], 'int4multirange')
+
+      mr.complement(r.call(0, 20, {})).must_equal @MR.new([r.call(0, 1, :exclude_end=>true), r.call(5, 10, :exclude_begin=>true, :exclude_end=>true), r.call(15, 20, :exclude_begin=>true)], 'int4multirange')
+      mr.complement.must_equal @MR.new([@R.new(nil, 1, :exclude_end=>true, :db_type=>'int4range'), r.call(5, 10, :exclude_begin=>true, :exclude_end=>true), @R.new(15, nil, :exclude_begin=>true, :db_type=>'int4range')], 'int4multirange')
+
+      (mr | mr).must_equal mr
+      (mr & mr).must_equal mr
+      (mr - mr).must_equal @MR.new([], 'int4multirange')
+    end
+
+    it "should support set operations between multiranges and with arrays" do
+      r = lambda{|b, e, opts={}| @R.new(b, e, {:db_type=>'int4range'}.merge(opts))}
+      mr1 = @MR.new([r.call(1, 5), r.call(10, 15)], 'int4multirange')
+      mr2 = @MR.new([r.call(3, 4), r.call(20, 25)], 'int4multirange')
+
+      (mr1 | mr2).must_equal @MR.new([r.call(1, 5), r.call(10, 15), r.call(20, 25)], 'int4multirange')
+      (mr1 & mr2).must_equal @MR.new([r.call(3, 4)], 'int4multirange')
+      (mr1 - mr2).must_equal @MR.new([r.call(1, 3, :exclude_end=>true), r.call(4, 5, :exclude_begin=>true), r.call(10, 15)], 'int4multirange')
+      (mr2 | [r.call(6, 9)]).must_equal @MR.new([r.call(3, 4), r.call(6, 9), r.call(20, 25)], 'int4multirange')
+      (mr1 & (2..12)).must_equal @MR.new([r.call(2, 5), r.call(10, 12)], 'int4multirange')
+    end
+
+    it "should normalize unsorted and overlapping ranges in set operations" do
+      r = lambda{|b, e, opts={}| @R.new(b, e, {:db_type=>'int4range'}.merge(opts))}
+      mr = @MR.new([r.call(10, 15), r.call(1, 5), r.call(4, 8)], 'int4multirange')
+      (mr | @R.empty('int4range')).must_equal @MR.new([r.call(1, 8), r.call(10, 15)], 'int4multirange')
+      (mr - r.call(6, 12)).must_equal @MR.new([r.call(1, 6, :exclude_end=>true), r.call(12, 15, :exclude_begin=>true)], 'int4multirange')
+    end
+
+    it "should raise Sequel::InvalidValue for set operations with incompatible types" do
+      mr = @MR.new([@R.new(1, 5, :db_type=>'int4range')], 'int4multirange')
+      proc{mr | @R.new(1, 2, :db_type=>'daterange')}.must_raise Sequel::InvalidValue
+      proc{mr & @MR.new([@R.new(1, 2, :db_type=>'numrange')], 'nummultirange')}.must_raise Sequel::InvalidValue
+      proc{mr - 5}.must_raise Sequel::InvalidValue
+    end
+
+    it "should literalize set operation results" do
+      mr = @MR.new([@R.new(1, 5, :db_type=>'int4range'), @R.new(10, 15, :db_type=>'int4range')], 'int4multirange')
+      @db.literal(mr & @R.new(4, 11, :db_type=>'int4range')).must_equal "int4multirange(int4range(4,5,'[]'), int4range(10,11,'[]'))"
+    end
   end
 end

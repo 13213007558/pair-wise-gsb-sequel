@@ -1,5 +1,7 @@
 === master
 
+* Add set operations (union, intersection, difference, complement) to PGRange and PGMultiRange in the pg_range and pg_multirange extensions
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

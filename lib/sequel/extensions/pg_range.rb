@@ -36,6 +36,30 @@
 # If you specify the range database type, Sequel will automatically cast
 # the value to that type when literalizing.
 #
+# PGRange also supports set operations in Ruby, without needing a
+# database connection:
+#
+#   r1 = Sequel.pg_range(1..5)
+#   r2 = Sequel.pg_range(4..10)
+#   r1 | r2             # union (also r1 + r2, r1.union(r2))
+#   r1 & r2             # intersection (also r1.intersection(r2))
+#   r1 - r2             # difference (also r1.difference(r2))
+#   r1.complement(0..20) # complement within the given bounding range
+#
+# Union, difference, and complement can result in multiple ranges, so
+# they return Sequel::Postgres::PGMultiRange instances (the
+# pg_multirange extension is loaded automatically by this extension).
+# Intersection returns a PGRange when both operands are single ranges.
+# All set operation results are normalized: the ranges are sorted,
+# non-overlapping, and cannot be merged further.  Ranges with integer
+# or date bounds use discrete semantics (adjacent ranges such as
+# [1,5] and [6,10] are merged), while ranges with continuous bounds
+# (such as numerics and timestamps) are only merged when they overlap
+# or share an endpoint included by at least one of the ranges.
+# Set operations never modify their operands, and raise
+# Sequel::InvalidValue if the operands have incompatible database
+# types or bounds that cannot be ordered.
+#
 # To use this extension, load it into the Database instance:
 #
 #   DB.extension :pg_range
@@ -65,6 +89,8 @@
 #   DB.extension :pg_array, :pg_range
 #
 # Related module: Sequel::Postgres::PGRange
+
+require 'sequel/extensions/pg_multirange'
 
 module Sequel
   module Postgres
@@ -496,6 +522,427 @@ module Sequel
       # Allow automatic parameterization for ranges with types, if both start .
       def sequel_auto_param_type(ds)
         "::#{db_type}" if db_type && (!@begin || ds.send(:auto_param_type, @begin)) && (!@end || ds.send(:auto_param_type, @end))
+      end
+
+      # Database range types with discrete subtypes.  Set operations on
+      # ranges of these types use discrete semantics, where one range's end
+      # and another range's start are adjacent if they are successors.
+      DISCRETE_DB_TYPES = %w'int4range int8range daterange'.freeze
+
+      # Database range types with continuous subtypes.  Set operations on
+      # ranges of these types use continuous semantics.
+      CONTINUOUS_DB_TYPES = %w'numrange tsrange tstzrange'.freeze
+
+      # Return a PGMultiRange containing the union of this range and the
+      # given range, multirange, or array of ranges.  The result is
+      # normalized, with ranges sorted, non-overlapping, and not mergeable.
+      def union(other)
+        left, right, db_type, discrete = PGRange.set_operation_context(self, other)
+        PGRange.multirange_result(PGRange.normalize_ranges(left + right, db_type, discrete), db_type)
+      end
+      alias | union
+      alias + union
+
+      # Return the intersection of this range and the given range,
+      # multirange, or array of ranges.  Returns a PGRange (possibly empty)
+      # if the other operand is a single range, and a PGMultiRange otherwise.
+      def intersection(other)
+        left, right, db_type, discrete = PGRange.set_operation_context(self, other)
+        ranges = PGRange.intersect_ranges(left, right, db_type, discrete)
+        if other.is_a?(PGMultiRange) || other.is_a?(Array)
+          PGRange.multirange_result(ranges, db_type)
+        else
+          ranges.empty? ? PGRange.empty(db_type) : ranges.first
+        end
+      end
+      alias & intersection
+
+      # Return a PGMultiRange containing the parts of this range that are
+      # not covered by the given range, multirange, or array of ranges.
+      # The result is normalized, with ranges sorted, non-overlapping, and
+      # not mergeable.
+      def difference(other)
+        left, right, db_type, discrete = PGRange.set_operation_context(self, other)
+        PGRange.multirange_result(PGRange.subtract_ranges(left, right, db_type, discrete), db_type)
+      end
+      alias - difference
+
+      # Return a PGMultiRange containing the parts of the given bounding
+      # range (or multirange) that are not covered by this range.  If no
+      # bounding range is given, an unbounded range is used, so the result
+      # contains all points not covered by this range.
+      def complement(frame=nil)
+        frame ||= PGRange.new(nil, nil)
+        left, right, db_type, discrete = PGRange.set_operation_context(frame, self)
+        PGRange.multirange_result(PGRange.subtract_ranges(left, right, db_type, discrete), db_type)
+      end
+
+      # Normalize an array of PGRanges, returning a new array of PGRanges
+      # that is sorted, with empty ranges removed, and overlapping or
+      # adjacent ranges merged.  If a database range type is given, the
+      # returned ranges use that type, and it is used to determine whether
+      # the ranges use discrete or continuous semantics.  If the discrete
+      # flag is not given, it is inferred from the database type or the
+      # range bounds.
+      def self.normalize_ranges(ranges, db_type=nil, discrete=nil)
+        discrete = resolve_discrete(db_type, ranges) if discrete.nil?
+        kept = ranges.reject{|range| empty_range?(range, discrete)}
+        return [] if kept.empty?
+        sorted = sort_ranges(kept)
+        result = [sorted.first]
+        sorted[1..-1].each do |range|
+          last = result[-1]
+          if mergeable_ranges?(last, range, discrete)
+            result[-1] = merge_ranges(last, range)
+          else
+            result << range
+          end
+        end
+        if db_type
+          db_type = db_type.to_s
+          result = result.map do |range|
+            if range.db_type == db_type
+              range
+            else
+              new(range.begin, range.end, :exclude_begin=>range.exclude_begin?, :exclude_end=>range.exclude_end?, :db_type=>db_type)
+            end
+          end
+        end
+        result
+      end
+
+      # Return an array of PGRanges covering the parts of the ranges in
+      # a_ranges that are also covered by the ranges in b_ranges.  Both
+      # arrays are normalized before intersecting, and the result is
+      # sorted and non-overlapping.
+      def self.intersect_ranges(a_ranges, b_ranges, db_type=nil, discrete=nil)
+        discrete = resolve_discrete(db_type, a_ranges + b_ranges) if discrete.nil?
+        a_ranges = normalize_ranges(a_ranges, db_type, discrete)
+        b_ranges = normalize_ranges(b_ranges, db_type, discrete)
+        ranges = []
+        a_ranges.each do |a|
+          b_ranges.each do |b|
+            range = intersect_pair(a, b)
+            ranges << range unless empty_range?(range, discrete)
+          end
+        end
+        ranges
+      end
+
+      # Return an array of PGRanges covering the parts of the ranges in
+      # a_ranges that are not covered by the ranges in b_ranges.  Both
+      # arrays are normalized before subtracting, and the result is
+      # sorted and non-overlapping.
+      def self.subtract_ranges(a_ranges, b_ranges, db_type=nil, discrete=nil)
+        discrete = resolve_discrete(db_type, a_ranges + b_ranges) if discrete.nil?
+        a_ranges = normalize_ranges(a_ranges, db_type, discrete)
+        b_ranges = normalize_ranges(b_ranges, db_type, discrete)
+        a_ranges.flat_map do |a|
+          pieces = [a]
+          b_ranges.each do |b|
+            pieces = pieces.flat_map{|piece| subtract_pair(piece, b, discrete)}
+            break if pieces.empty?
+          end
+          pieces
+        end
+      end
+
+      # Prepare two operands for a set operation, returning an array with
+      # the left ranges, the right ranges, the shared database range type
+      # (nil if untyped), and whether the ranges use discrete semantics.
+      # Operands can be PGRanges, PGMultiRanges, ruby Ranges, or arrays of
+      # ranges.  Raises Sequel::InvalidValue if the operands use
+      # incompatible database types or bounds.
+      def self.set_operation_context(left, right)
+        types = []
+        left = set_operation_ranges(left, types)
+        right = set_operation_ranges(right, types)
+        db_type = set_operation_db_type(types)
+        discrete = resolve_discrete(db_type, left + right)
+        [left, right, db_type, discrete]
+      end
+
+      # Return a PGMultiRange for the given normalized ranges, mapping the
+      # given database range type to the related multirange type.
+      def self.multirange_result(ranges, db_type)
+        PGMultiRange.new(ranges, multirange_type(db_type))
+      end
+
+      # Compare two range bound values, raising Sequel::InvalidValue if
+      # the values cannot be ordered.
+      def self.compare_bounds(a, b)
+        begin
+          result = a <=> b
+        rescue NoMethodError
+          result = nil
+        end
+        unless result
+          raise InvalidValue, "cannot order range bounds #{a.inspect} and #{b.inspect}"
+        end
+        result
+      end
+
+      # Whether the given range is empty, treating ranges such as (1,2)
+      # for discrete types as empty even if they were not created with the
+      # :empty option.
+      def self.empty_range?(range, discrete)
+        return true if range.empty?
+        beg = range.begin
+        en = range.end
+        return false if beg.nil? || en.nil?
+        if discrete
+          beg = beg.succ if range.exclude_begin?
+          en = en.succ unless range.exclude_end?
+          compare_bounds(beg, en) >= 0
+        else
+          cmp = compare_bounds(beg, en)
+          cmp > 0 || (cmp == 0 && (range.exclude_begin? || range.exclude_end?))
+        end
+      end
+
+      # Whether two sorted ranges (a starting no later than b) overlap or
+      # are adjacent, so that they can be merged into a single range.
+      def self.mergeable_ranges?(a, b, discrete)
+        return true if a.end.nil? || b.begin.nil?
+        cmp = compare_bounds(a.end, b.begin)
+        return true if cmp > 0
+        if cmp.zero?
+          # Mergeable if at least one of the ranges includes the shared
+          # endpoint.  If both exclude it, the endpoint itself is a gap.
+          return !(a.exclude_end? && b.exclude_begin?)
+        end
+        if discrete
+          a_reach = a.exclude_end? ? a.end : a.end.succ
+          b_start = b.exclude_begin? ? b.begin.succ : b.begin
+          compare_bounds(a_reach, b_start) >= 0
+        else
+          false
+        end
+      end
+
+      # The base range type for the given range or multirange database
+      # type (e.g. 'int4range' for 'int4multirange').
+      def self.base_range_type(db_type)
+        if db_type
+          db_type.to_s.sub('multi', '')
+        end
+      end
+
+      # The multirange database type for the given database range type
+      # (e.g. 'int4multirange' for 'int4range'), or nil if the type does
+      # not follow the standard naming convention.
+      def self.multirange_type(db_type)
+        if db_type
+          db_type = db_type.to_s
+          if db_type.end_with?('range')
+            db_type.sub(/range\z/, 'multirange')
+          end
+        end
+      end
+
+      # Whether the value uses discrete semantics as a range bound.
+      # Integers and dates are discrete; other types (including
+      # DateTime) are continuous.
+      def self.discrete_bound?(value)
+        case value
+        when Integer
+          true
+        when DateTime
+          false
+        when Date
+          true
+        else
+          false
+        end
+      end
+
+      # Whether ranges with the given database type and bounds use
+      # discrete semantics.  Returns nil if it cannot be determined.
+      # Raises Sequel::InvalidValue when mixing discrete and continuous
+      # bounds.
+      def self.discrete_ranges?(db_type, ranges)
+        if db_type
+          db_type = base_range_type(db_type)
+          return true if DISCRETE_DB_TYPES.include?(db_type)
+          return false if CONTINUOUS_DB_TYPES.include?(db_type)
+        end
+        discrete = nil
+        ranges.each do |range|
+          [range.begin, range.end].each do |value|
+            next if value.nil?
+            d = discrete_bound?(value)
+            if discrete.nil?
+              discrete = d
+            elsif discrete != d
+              raise InvalidValue, "cannot mix discrete and continuous bounds in a range set operation"
+            end
+          end
+        end
+        discrete
+      end
+
+      # Whether ranges with the given database type and bounds use
+      # discrete semantics, defaulting to false when it cannot be
+      # determined.  Raises Sequel::InvalidValue if the ranges are
+      # discrete but have bounds that do not support a successor.
+      def self.resolve_discrete(db_type, ranges)
+        discrete = discrete_ranges?(db_type, ranges)
+        discrete = false if discrete.nil?
+        if discrete
+          ranges.each do |range|
+            [range.begin, range.end].each do |value|
+              if !value.nil? && !value.respond_to?(:succ)
+                raise InvalidValue, "discrete range bound does not support succ: #{value.inspect}"
+              end
+            end
+          end
+        end
+        discrete
+      end
+
+      # Sort the ranges by their beginnings, with unbounded beginnings
+      # first, and inclusive beginnings before exclusive ones.
+      def self.sort_ranges(ranges)
+        ranges.sort do |a, b|
+          ab = a.begin
+          bb = b.begin
+          if ab.nil?
+            bb.nil? ? (a.exclude_begin? ? 1 : 0) <=> (b.exclude_begin? ? 1 : 0) : -1
+          elsif bb.nil?
+            1
+          else
+            cmp = compare_bounds(ab, bb)
+            cmp.zero? ? (a.exclude_begin? ? 1 : 0) <=> (b.exclude_begin? ? 1 : 0) : cmp
+          end
+        end
+      end
+
+      # Merge two overlapping or adjacent ranges into a new PGRange.
+      def self.merge_ranges(a, b)
+        if a.end.nil? || b.end.nil?
+          en = nil
+          en_ex = false
+        else
+          cmp = compare_bounds(a.end, b.end)
+          if cmp > 0
+            en = a.end
+            en_ex = a.exclude_end?
+          elsif cmp < 0
+            en = b.end
+            en_ex = b.exclude_end?
+          else
+            en = a.end
+            en_ex = a.exclude_end? && b.exclude_end?
+          end
+        end
+        new(a.begin, en, :exclude_begin=>a.begin.nil? ? false : a.exclude_begin?, :exclude_end=>en_ex, :db_type=>a.db_type || b.db_type)
+      end
+
+      # Return a new PGRange covering the intersection of two ranges.
+      # The result may be empty; use empty_range? to check.
+      def self.intersect_pair(a, b)
+        if a.begin.nil?
+          lo = b.begin
+          lo_ex = b.exclude_begin?
+        elsif b.begin.nil?
+          lo = a.begin
+          lo_ex = a.exclude_begin?
+        else
+          cmp = compare_bounds(a.begin, b.begin)
+          if cmp < 0
+            lo = b.begin
+            lo_ex = b.exclude_begin?
+          elsif cmp > 0
+            lo = a.begin
+            lo_ex = a.exclude_begin?
+          else
+            lo = a.begin
+            lo_ex = a.exclude_begin? || b.exclude_begin?
+          end
+        end
+        if a.end.nil?
+          hi = b.end
+          hi_ex = b.exclude_end?
+        elsif b.end.nil?
+          hi = a.end
+          hi_ex = a.exclude_end?
+        else
+          cmp = compare_bounds(a.end, b.end)
+          if cmp < 0
+            hi = a.end
+            hi_ex = a.exclude_end?
+          elsif cmp > 0
+            hi = b.end
+            hi_ex = b.exclude_end?
+          else
+            hi = a.end
+            hi_ex = a.exclude_end? || b.exclude_end?
+          end
+        end
+        lo_ex = false if lo.nil?
+        hi_ex = false if hi.nil?
+        new(lo, hi, :exclude_begin=>lo_ex, :exclude_end=>hi_ex, :db_type=>a.db_type || b.db_type)
+      end
+
+      # Return an array of PGRanges covering the parts of range a that
+      # are not covered by range b.
+      def self.subtract_pair(a, b, discrete)
+        return [a] if empty_range?(b, discrete)
+        return [a] if empty_range?(intersect_pair(a, b), discrete)
+        db_type = a.db_type || b.db_type
+        pieces = []
+        unless b.begin.nil?
+          left = new(a.begin, b.begin, :exclude_begin=>a.begin.nil? ? false : a.exclude_begin?, :exclude_end=>!b.exclude_begin?, :db_type=>db_type)
+          pieces << left unless empty_range?(left, discrete)
+        end
+        unless b.end.nil?
+          right = new(b.end, a.end, :exclude_begin=>!b.exclude_end?, :exclude_end=>a.end.nil? ? false : a.exclude_end?, :db_type=>db_type)
+          pieces << right unless empty_range?(right, discrete)
+        end
+        pieces
+      end
+
+      # Convert a set operation operand into an array of PGRanges,
+      # adding the operand's database type to the types array.
+      def self.set_operation_ranges(operand, types)
+        case operand
+        when PGRange
+          types << operand.db_type
+          [operand]
+        when PGMultiRange
+          types << operand.db_type
+          operand.map{|range| set_operation_range(range)}
+        when Range
+          [from_range(operand)]
+        when Array
+          operand.map{|range| set_operation_range(range)}
+        else
+          raise InvalidValue, "cannot perform range set operation with #{operand.inspect}"
+        end
+      end
+
+      # Convert the object to a PGRange for use in a set operation.
+      def self.set_operation_range(obj)
+        case obj
+        when PGRange
+          obj
+        when Range
+          from_range(obj)
+        else
+          raise InvalidValue, "cannot perform range set operation with #{obj.inspect}"
+        end
+      end
+
+      # Given the database types of the operands of a set operation,
+      # return the shared base range type, or nil if all operands are
+      # untyped.  Raises Sequel::InvalidValue if the operands use
+      # incompatible database types.
+      def self.set_operation_db_type(types)
+        types = types.map{|t| base_range_type(t)}.compact.reject{|t| t.empty?}.uniq
+        if types.length > 1
+          raise InvalidValue, "cannot perform range set operation on ranges with different database types: #{types.join(', ')}"
+        end
+        types.first
       end
 
       private

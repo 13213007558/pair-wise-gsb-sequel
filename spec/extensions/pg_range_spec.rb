@@ -630,4 +630,183 @@ describe "pg_range extension" do
       @R.new(nil, nil).valid_ruby_range?.must_equal(startless_range_support)
     end
   end
+
+  describe "set operations" do
+    before do
+      @MR = Sequel::Postgres::PGMultiRange
+    end
+
+    it "should compute union, intersection, difference, and complement for discrete ranges" do
+      r = lambda{|b, e, opts| @R.new(b, e, {:db_type=>'int4range'}.merge(opts))}
+      mr = lambda{|ranges| @MR.new(ranges, 'int4multirange')}
+
+      # adjacent integer ranges are merged using discrete successor semantics
+      (r.call(1, 5, {}) | r.call(6, 10, {})).must_equal mr.call([r.call(1, 10, {})])
+      (r.call(1, 5, :exclude_end=>true) | r.call(5, 10, {})).must_equal mr.call([r.call(1, 10, {})])
+      # ranges with a gap are not merged
+      (r.call(1, 5, {}) | r.call(7, 10, {})).must_equal mr.call([r.call(1, 5, {}), r.call(7, 10, {})])
+      (r.call(1, 5, :exclude_end=>true) | r.call(5, 10, :exclude_begin=>true)).must_equal mr.call([r.call(1, 5, :exclude_end=>true), r.call(5, 10, :exclude_begin=>true)])
+      # union also works with + and #union
+      (r.call(1, 5, {}) + r.call(6, 10, {})).must_equal mr.call([r.call(1, 10, {})])
+      r.call(1, 5, {}).union(r.call(6, 10, {})).must_equal mr.call([r.call(1, 10, {})])
+
+      # intersection returns a PGRange
+      (r.call(1, 10, {}) & r.call(5, 20, {})).must_equal r.call(5, 10, {})
+      (r.call(1, 10, {}) & r.call(11, 20, {})).must_equal @R.empty('int4range')
+      r.call(1, 10, {}).intersection(r.call(5, 20, {})).must_equal r.call(5, 10, {})
+
+      # difference can split a range in two
+      (r.call(1, 10, {}) - r.call(4, 6, {})).must_equal mr.call([r.call(1, 4, :exclude_end=>true), r.call(6, 10, :exclude_begin=>true)])
+      (r.call(1, 10, {}) - r.call(1, 10, {})).must_equal mr.call([])
+      r.call(1, 10, {}).difference(r.call(4, 6, {})).must_equal mr.call([r.call(1, 4, :exclude_end=>true), r.call(6, 10, :exclude_begin=>true)])
+
+      # complement within a bounding range
+      r.call(3, 5, {}).complement(r.call(0, 10, {})).must_equal mr.call([r.call(0, 3, :exclude_end=>true), r.call(5, 10, :exclude_begin=>true)])
+      # complement without a bounding range is unbounded on both sides
+      r.call(3, 5, {}).complement.must_equal mr.call([@R.new(nil, 3, :exclude_end=>true, :db_type=>'int4range'), @R.new(5, nil, :exclude_begin=>true, :db_type=>'int4range')])
+    end
+
+    it "should use discrete successor semantics for date ranges" do
+      d1 = Date.new(2024, 1, 1)
+      d2 = Date.new(2024, 1, 5)
+      d3 = Date.new(2024, 1, 6)
+      d4 = Date.new(2024, 1, 10)
+      r = lambda{|b, e| @R.new(b, e, :db_type=>'daterange')}
+      (r.call(d1, d2) | r.call(d3, d4)).must_equal @MR.new([r.call(d1, d4)], 'datemultirange')
+      (r.call(d1, d2) | r.call(d3 + 1, d4)).must_equal @MR.new([r.call(d1, d2), r.call(d3 + 1, d4)], 'datemultirange')
+      (r.call(d1, d4) - r.call(d2, d3)).must_equal @MR.new([@R.new(d1, d2, :exclude_end=>true, :db_type=>'daterange'), @R.new(d3, d4, :exclude_begin=>true, :db_type=>'daterange')], 'datemultirange')
+    end
+
+    it "should not apply discrete successor semantics to continuous ranges" do
+      r = lambda{|b, e, opts| @R.new(b, e, {:db_type=>'numrange'}.merge(opts))}
+      mr = lambda{|ranges| @MR.new(ranges, 'nummultirange')}
+
+      # continuous ranges do not merge across a gap, even with integer bounds
+      (r.call(1, 5, {}) | r.call(6, 10, {})).must_equal mr.call([r.call(1, 5, {}), r.call(6, 10, {})])
+      # continuous ranges sharing a single closed endpoint are merged
+      (r.call(1.0, 5.0, {}) | r.call(5.0, 10.0, :exclude_begin=>true)).must_equal mr.call([r.call(1.0, 10.0, {})])
+      (r.call(1.0, 5.0, :exclude_end=>true) | r.call(5.0, 10.0, {})).must_equal mr.call([r.call(1.0, 10.0, {})])
+      # continuous ranges both excluding the shared endpoint are not merged
+      (r.call(1.0, 5.0, :exclude_end=>true) | r.call(5.0, 10.0, :exclude_begin=>true)).must_equal mr.call([r.call(1.0, 5.0, :exclude_end=>true), r.call(5.0, 10.0, :exclude_begin=>true)])
+      # intersection of continuous ranges sharing a closed endpoint is a single point
+      (r.call(1.0, 5.0, {}) & r.call(5.0, 10.0, {})).must_equal r.call(5.0, 5.0, {})
+      (r.call(1.0, 5.0, :exclude_end=>true) & r.call(5.0, 10.0, {})).must_equal @R.empty('numrange')
+      # difference keeps the endpoint when the subtracted range excludes it
+      (r.call(1.0, 10.0, {}) - r.call(5.0, 10.0, :exclude_begin=>true)).must_equal mr.call([r.call(1.0, 5.0, {})])
+      (r.call(1.0, 10.0, {}) - r.call(5.0, 10.0, {})).must_equal mr.call([r.call(1.0, 5.0, :exclude_end=>true)])
+    end
+
+    it "should handle empty and unbounded ranges in set operations" do
+      e = @R.empty('int4range')
+      r = @R.new(1, 5, :db_type=>'int4range')
+      mr = lambda{|ranges| @MR.new(ranges, 'int4multirange')}
+
+      (e | r).must_equal mr.call([r])
+      (e & r).must_equal e
+      (r - e).must_equal mr.call([r])
+      (e - r).must_equal mr.call([])
+
+      unbounded = @R.new(nil, nil, :db_type=>'int4range')
+      (r & unbounded).must_equal r
+      (unbounded - r).must_equal mr.call([@R.new(nil, 1, :exclude_end=>true, :db_type=>'int4range'), @R.new(5, nil, :exclude_begin=>true, :db_type=>'int4range')])
+      (r - unbounded).must_equal mr.call([])
+      (r | unbounded).must_equal mr.call([unbounded])
+
+      # ranges that are empty after discrete canonicalization are treated as empty
+      (@R.new(1, 2, :exclude_begin=>true, :exclude_end=>true, :db_type=>'int4range') | r).must_equal mr.call([r])
+      (@R.new(1, 2, :exclude_begin=>true, :exclude_end=>true, :db_type=>'int4range') & r).must_equal @R.empty('int4range')
+    end
+
+    it "should accept ruby ranges and arrays as set operation operands" do
+      r = @R.new(1, 5, :db_type=>'int4range')
+      (r | (6..8)).must_equal @MR.new([@R.new(1, 8, :db_type=>'int4range')], 'int4multirange')
+      (r & (3..8)).must_equal @R.new(3, 5, :db_type=>'int4range')
+      (r - (2..3)).must_equal @MR.new([@R.new(1, 2, :exclude_end=>true, :db_type=>'int4range'), @R.new(3, 5, :exclude_begin=>true, :db_type=>'int4range')], 'int4multirange')
+      (@R.new(1, 10, :db_type=>'int4range') & [@R.new(2, 4, :db_type=>'int4range'), @R.new(6, 8, :db_type=>'int4range')]).must_equal @MR.new([@R.new(2, 4, :db_type=>'int4range'), @R.new(6, 8, :db_type=>'int4range')], 'int4multirange')
+    end
+
+    it "should raise Sequel::InvalidValue for incompatible types and unorderable bounds" do
+      proc{@R.new(1, 2, :db_type=>'int4range') | @R.new(3, 4, :db_type=>'daterange')}.must_raise Sequel::InvalidValue
+      proc{@R.new(1, 2.5) | @R.new(3, 4)}.must_raise Sequel::InvalidValue
+      proc{@R.new('a', 'z') & @R.new(1.0, 2.0)}.must_raise Sequel::InvalidValue
+      proc{@R.new(1.5, 2.5, :db_type=>'int4range') | @R.new(3, 4, :db_type=>'int4range')}.must_raise Sequel::InvalidValue
+      proc{@R.new(1, 2) | 5}.must_raise Sequel::InvalidValue
+      proc{@R.new(1, 2) - nil}.must_raise Sequel::InvalidValue
+    end
+
+    it "should not modify the operands of set operations" do
+      r1 = @R.new(1, 5, :db_type=>'int4range')
+      r2 = @R.new(3, 7, :db_type=>'int4range')
+      mr = @MR.new([r1, @R.new(10, 12, :db_type=>'int4range')], 'int4multirange')
+      before = [r1.inspect, r2.inspect, mr.inspect, mr.to_a.inspect]
+      r1 | r2
+      r1 & r2
+      r1 - r2
+      r1.complement(@R.new(0, 10, :db_type=>'int4range'))
+      mr | r2
+      mr & r2
+      mr - r2
+      mr.complement
+      [r1.inspect, r2.inspect, mr.inspect, mr.to_a.inspect].must_equal before
+    end
+
+    it "should literalize set operation results" do
+      @db.literal(@R.new(1, 5, :db_type=>'int4range') | @R.new(7, 9, :db_type=>'int4range')).must_equal "int4multirange(int4range(1,5,'[]'), int4range(7,9,'[]'))"
+      @db.literal(@R.new(1, 9, :db_type=>'int4range') - @R.new(3, 5, :db_type=>'int4range')).must_equal "int4multirange(int4range(1,3,'[)'), int4range(5,9,'(]'))"
+      @db.literal(@R.new(1, 9, :db_type=>'int4range') - @R.new(1, 9, :db_type=>'int4range')).must_equal "int4multirange()"
+    end
+
+    it "should cross-check set operations on a small integer domain against set enumeration" do
+      domain = (0..3).to_a
+      bounds = (0..4).to_a
+      ranges = []
+      bounds.each do |b|
+        bounds.each do |e|
+          [false, true].each do |eb|
+            [false, true].each do |ee|
+              ranges << @R.new(b, e, :exclude_begin=>eb, :exclude_end=>ee, :db_type=>'int4range')
+            end
+          end
+        end
+      end
+      bounds.each do |v|
+        [false, true].each do |ee|
+          ranges << @R.new(nil, v, :exclude_end=>ee, :db_type=>'int4range')
+        end
+        [false, true].each do |eb|
+          ranges << @R.new(v, nil, :exclude_begin=>eb, :db_type=>'int4range')
+        end
+      end
+      ranges << @R.new(nil, nil, :db_type=>'int4range')
+      ranges << @R.empty('int4range')
+
+      to_set = lambda{|range| domain.select{|i| range.cover?(i)}}
+      mr_to_set = lambda{|mr| mr.map{|range| to_set.call(range)}.flatten.uniq.sort}
+      check_normalized = lambda do |mr|
+        mr.each_cons(2) do |a, b|
+          @R.mergeable_ranges?(a, b, true).must_equal false
+        end
+      end
+
+      frame = @R.new(1, 3, :db_type=>'int4range')
+      frame_set = to_set.call(frame)
+      ranges.each do |r1|
+        s1 = to_set.call(r1)
+        mr_to_set.call(r1.complement(frame)).must_equal (frame_set - s1).sort
+        ranges.each do |r2|
+          s2 = to_set.call(r2)
+          union = r1 | r2
+          union.class.must_equal @MR
+          mr_to_set.call(union).must_equal (s1 | s2).sort
+          check_normalized.call(union.to_a)
+          intersection = r1 & r2
+          intersection.must_be_instance_of @R
+          to_set.call(intersection).must_equal (s1 & s2).sort
+          difference = r1 - r2
+          mr_to_set.call(difference).must_equal (s1 - s2).sort
+          check_normalized.call(difference.to_a)
+        end
+      end
+    end
+  end
 end

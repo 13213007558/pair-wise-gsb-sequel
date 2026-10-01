@@ -47,6 +47,20 @@
 #
 # The pg_multirange extension will automatically load the pg_range extension.
 #
+# PGMultiRange supports set operations in Ruby, without needing a database
+# connection, using the same semantics as the set operations on
+# Sequel::Postgres::PGRange (see the pg_range extension):
+#
+#   mr1 | mr2  # union (also mr1 + mr2, mr1.union(mr2))
+#   mr1 & mr2  # intersection (also mr1.intersection(mr2))
+#   mr1 - mr2  # difference (also mr1.difference(mr2))
+#   mr1.complement(frame)  # complement within the given bounding range
+#
+# All set operations return new PGMultiRange instances with normalized
+# ranges (sorted, non-overlapping, and not mergeable), and never modify
+# their operands.  Operands can be PGRanges, PGMultiRanges, ruby Ranges,
+# or arrays of ranges.
+#
 # Related module: Sequel::Postgres::PGMultiRange
 
 require 'delegate'
@@ -295,6 +309,42 @@ module Sequel
         any?{|range| range.cover?(value)}
       end
       alias === cover?
+
+      # Return a PGMultiRange containing the union of this multirange and
+      # the given range, multirange, or array of ranges.  The result is
+      # normalized, with ranges sorted, non-overlapping, and not mergeable.
+      def union(other)
+        left, right, db_type, discrete = PGRange.set_operation_context(self, other)
+        PGRange.multirange_result(PGRange.normalize_ranges(left + right, db_type, discrete), db_type)
+      end
+      alias | union
+      alias + union
+
+      # Return a PGMultiRange containing the intersection of this
+      # multirange and the given range, multirange, or array of ranges.
+      def intersection(other)
+        left, right, db_type, discrete = PGRange.set_operation_context(self, other)
+        PGRange.multirange_result(PGRange.intersect_ranges(left, right, db_type, discrete), db_type)
+      end
+      alias & intersection
+
+      # Return a PGMultiRange containing the parts of this multirange that
+      # are not covered by the given range, multirange, or array of ranges.
+      def difference(other)
+        left, right, db_type, discrete = PGRange.set_operation_context(self, other)
+        PGRange.multirange_result(PGRange.subtract_ranges(left, right, db_type, discrete), db_type)
+      end
+      alias - difference
+
+      # Return a PGMultiRange containing the parts of the given bounding
+      # range (or multirange) that are not covered by this multirange.  If
+      # no bounding range is given, an unbounded range is used, so the
+      # result contains all points not covered by this multirange.
+      def complement(frame=nil)
+        frame ||= PGRange.new(nil, nil)
+        left, right, db_type, discrete = PGRange.set_operation_context(frame, self)
+        PGRange.multirange_result(PGRange.subtract_ranges(left, right, db_type, discrete), db_type)
+      end
 
       # Don't consider multiranges with different database types equal.
       def eql?(other)
