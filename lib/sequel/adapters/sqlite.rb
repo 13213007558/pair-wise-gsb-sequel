@@ -173,6 +173,25 @@ module Sequel
         @allow_regexp
       end
 
+      # Start a new database transaction on the given connection.  SQLite
+      # supports the :mode transaction option, which can be set to
+      # :deferred, :immediate, or :exclusive to control which lock the
+      # transaction acquires when it starts.  Using :immediate makes the
+      # transaction acquire the database write lock when it begins, so
+      # concurrent write transactions are serialized when they begin
+      # instead of deadlocking when they first write.
+      def begin_new_transaction(conn, opts)
+        if mode = opts[:mode]
+          unless [:deferred, :immediate, :exclusive].include?(mode)
+            raise Error, "unsupported SQLite transaction mode: #{mode.inspect}"
+          end
+          log_connection_execute(conn, "BEGIN #{mode.to_s.upcase}")
+          set_transaction_isolation(conn, opts)
+        else
+          super
+        end
+      end
+
       # Disconnect given connections from the database.
       def disconnect_connection(c)
         c.prepared_statements.each_value{|v| v.first.close}

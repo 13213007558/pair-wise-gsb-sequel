@@ -169,6 +169,11 @@ module Sequel
     # :skip_transaction :: If set, do not actually open a transaction or savepoint,
     #                      just checkout a connection and yield it.
     #
+    # SQLite specific options:
+    #
+    # :mode :: If present, set the transaction mode, must be :deferred,
+    #          :immediate, or :exclusive.
+    #
     # PostgreSQL specific options:
     #
     # :deferrable :: (9.1+) If present, set to DEFERRABLE if true or NOT DEFERRABLE if false.
