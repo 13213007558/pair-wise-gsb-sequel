@@ -129,4 +129,41 @@ module Sequel
       end
     end
   end
+
+  # Handles extracting window functions from expressions, replacing them
+  # with identifiers that reference generated aliases.  Used to implement
+  # filtering on the results of window functions on databases that do not
+  # support such filtering natively, by moving the window functions into
+  # a subquery and referencing the aliases in an outer query.
+  class WindowFunctionExtractor < ASTTransformer
+    # An array of pairs, each pair containing the generated alias symbol
+    # and the related window function (SQL::Function), for all window
+    # functions extracted from the transformed expression.
+    attr_reader :window_functions
+
+    def initialize
+      @window_functions = []
+      @function_aliases = {}
+      super()
+    end
+
+    private
+
+    # Replace window functions with identifiers referencing the generated
+    # alias for the window function, recording the window function so it
+    # can be added to a subquery.  Duplicate window functions use the same
+    # alias.
+    def v(o)
+      if o.is_a?(SQL::Function) && o.opts[:over]
+        unless aliaz = @function_aliases[o]
+          aliaz = :"__window_filter_#{@window_functions.length + 1}"
+          @function_aliases[o] = aliaz
+          @window_functions << [aliaz, o]
+        end
+        SQL::Identifier.new(aliaz)
+      else
+        super
+      end
+    end
+  end
 end

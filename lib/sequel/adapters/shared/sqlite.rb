@@ -592,7 +592,7 @@ module Sequel
 
       Dataset.def_sql_method(self, :delete, [['if db.sqlite_version >= 33500', %w'with delete from where returning'], ['elsif db.sqlite_version >= 30803', %w'with delete from where'], ["else", %w'delete from where']])
       Dataset.def_sql_method(self, :insert, [['if db.sqlite_version >= 33500', %w'with insert conflict into columns values on_conflict returning'], ['elsif db.sqlite_version >= 30803', %w'with insert conflict into columns values on_conflict'], ["else", %w'insert conflict into columns values']])
-      Dataset.def_sql_method(self, :select, [['if opts[:values]', %w'with values compounds'], ['else', %w'with select distinct columns from join where group having window compounds order limit lock']])
+      Dataset.def_sql_method(self, :select, [['if opts[:values]', %w'with values compounds'], ['else', %w'with select distinct columns from join where group having window qualify compounds order limit lock']])
       Dataset.def_sql_method(self, :update, [['if db.sqlite_version >= 33500', %w'with update table set from where returning'], ['elsif db.sqlite_version >= 33300', %w'with update table set from where'], ['elsif db.sqlite_version >= 30803', %w'with update table set where'], ["else", %w'update table set where']])
 
       def cast_sql_append(sql, expr, type)

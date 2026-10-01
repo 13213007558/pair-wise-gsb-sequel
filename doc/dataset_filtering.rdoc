@@ -227,3 +227,28 @@ By default, if you chain calls to +where+, the conditions get ANDed together.  I
 
   items.where(name: 'Food').or(vendor: 1).sql
   # "SELECT * FROM items WHERE ((name = 'Food') OR (vendor = 1))"
+
+== Filtering on window function results
+
+While +where+ conditions are evaluated before window functions are computed, +window_filter+
+conditions are evaluated after, allowing you to filter on the results of window functions
+as well as aliases defined in the SELECT list:
+
+  sales.window_filter(Sequel.function(:row_number).over(partition: :region, order: Sequel.desc(:amount)) <= 3)
+
+On databases that support the QUALIFY clause, +window_filter+ uses it:
+
+  # SELECT * FROM sales QUALIFY (row_number() OVER (PARTITION BY region ORDER BY amount DESC) <= 3)
+
+On other databases, support is emulated by moving the window functions in the filter to
+hidden columns in a subquery, and filtering on them in an outer query:
+
+  # SELECT region, amount FROM (
+  #   SELECT *, row_number() OVER (PARTITION BY region ORDER BY amount DESC) AS __window_filter_1
+  #   FROM sales
+  # ) AS t1
+  # WHERE (__window_filter_1 <= 3)
+
+Note that on databases without native support, dataset methods called after +window_filter+
+(such as +order+, +limit+, and +distinct+) operate on the outer query, while methods called
+before +window_filter+ operate on the subquery.

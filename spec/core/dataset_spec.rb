@@ -4891,6 +4891,115 @@ describe "Dataset#window" do
   end
 end
 
+describe "Dataset#window_filter" do
+  before do
+    @db = Sequel.mock(:columns=>[:a, :b])
+    @ds = @db[:t].with_extend{def supports_window_functions?; true end}
+    @rn = Sequel.function(:row_number).over(:partition=>:a, :order=>Sequel.desc(:b))
+  end
+
+  it "should not support native window filters by default" do
+    @db.dataset.supports_native_window_filter?.must_equal false
+  end
+
+  it "should use a derived table, moving window functions in the filter to the subquery" do
+    @ds.window_filter(@rn <= 3).sql.must_equal 'SELECT a, b FROM (SELECT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 <= 3)'
+  end
+
+  it "should support multiple window functions in the filter, deduplicating identical ones" do
+    ds = @ds.window_filter((@rn <= 3) & (Sequel.function(:sum, :b).over(:partition=>:a) > 100) & (@rn >= 1))
+    ds.sql.must_equal 'SELECT a, b FROM (SELECT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1, sum(b) OVER (PARTITION BY a) AS __window_filter_2 FROM t) AS t1 WHERE ((__window_filter_1 <= 3) AND (__window_filter_2 > 100) AND (__window_filter_1 >= 1))'
+  end
+
+  it "should not add hidden columns to the subquery when the filter only references existing aliases" do
+    ds = @ds.select{sum(:b).over(:partition=>:a).as(:s)}.window_filter(Sequel[:s] > 100)
+    ds.sql.must_equal 'SELECT * FROM (SELECT sum(b) OVER (PARTITION BY a) AS s FROM t) AS t1 WHERE (s > 100)'
+  end
+
+  it "should use the SELECT list for outer columns when it is explicit" do
+    @ds.select(:a, :b).window_filter(@rn <= 3).sql.must_equal 'SELECT a, b FROM (SELECT a, b, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 <= 3)'
+  end
+
+  it "should use aliases for outer columns when the SELECT list uses aliases" do
+    ds = @ds.select(Sequel[:a].as(:x), Sequel[:b].as(:y), Sequel[:t][:b].as(:z)).window_filter(@rn <= 3)
+    ds.sql.must_equal 'SELECT x, y, z FROM (SELECT a AS x, b AS y, t.b AS z, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 <= 3)'
+  end
+
+  it "should expand SELECT * to the dataset columns for the outer query" do
+    @ds.window_filter(@rn <= 3).sql.must_equal 'SELECT a, b FROM (SELECT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 <= 3)'
+  end
+
+  it "should raise an error if outer columns cannot be determined" do
+    ds = Sequel.mock[:t].with_extend{def supports_window_functions?; true end}
+    proc{ds.window_filter(@rn <= 3)}.must_raise(Sequel::Error)
+  end
+
+  it "should not modify the receiver" do
+    ds = @ds.where(:a=>1).order(:a)
+    ds.window_filter(@rn <= 3)
+    ds.sql.must_equal 'SELECT * FROM t WHERE (a = 1) ORDER BY a'
+    ds.opts[:window_filter].must_be_nil
+    ds.opts[:where].must_equal Sequel::SQL::BooleanExpression.from_value_pairs(:a=>1)
+  end
+
+  it "should not put window filter conditions in the WHERE clause of the subquery" do
+    ds = @ds.where(:a=>1).window_filter(@rn <= 3)
+    ds.sql.must_equal 'SELECT a, b FROM (SELECT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t WHERE (a = 1)) AS t1 WHERE (__window_filter_1 <= 3)'
+    ds.opts[:where].wont_be_nil
+  end
+
+  it "should apply order, limit, and distinct called after window_filter to the outer query" do
+    ds = @ds.window_filter(@rn <= 3).order(:a).limit(2).distinct
+    ds.sql.must_equal 'SELECT DISTINCT a, b FROM (SELECT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 <= 3) ORDER BY a LIMIT 2'
+  end
+
+  it "should apply order, limit, and distinct called before window_filter to the subquery" do
+    ds = @ds.distinct.order(:a).limit(2).window_filter(@rn <= 3)
+    ds.sql.must_equal 'SELECT a, b FROM (SELECT DISTINCT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t ORDER BY a LIMIT 2) AS t1 WHERE (__window_filter_1 <= 3)'
+  end
+
+  it "should nest derived tables for multiple window_filter calls" do
+    ds = @ds.window_filter(@rn <= 3).window_filter(Sequel.function(:rank).over(:partition=>:a) <= 2)
+    ds.sql.must_equal 'SELECT a, b FROM (SELECT a, b, rank() OVER (PARTITION BY a) AS __window_filter_1 FROM (SELECT *, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 <= 3)) AS t1 WHERE (__window_filter_1 <= 2)'
+  end
+
+  it "should support hash conditions" do
+    @ds.window_filter(:a=>1).sql.must_equal 'SELECT * FROM (SELECT * FROM t) AS t1 WHERE (a = 1)'
+  end
+
+  it "should support virtual row blocks" do
+    @ds.window_filter{sum(:b).over(:partition=>:a) > 100}.sql.must_equal 'SELECT a, b FROM (SELECT *, sum(b) OVER (PARTITION BY a) AS __window_filter_1 FROM t) AS t1 WHERE (__window_filter_1 > 100)'
+  end
+
+  it "should raise an error when called without arguments or a block" do
+    proc{@ds.window_filter}.must_raise(Sequel::Error)
+  end
+
+  it "should be a no-op when called with an empty hash or array" do
+    ds = @ds.window_filter({})
+    ds.must_be_same_as @ds
+    ds = @ds.window_filter([])
+    ds.must_be_same_as @ds
+  end
+
+  it "should use QUALIFY when the dataset supports native window filters" do
+    ds = @ds.with_extend{def supports_native_window_filter?; true end}
+    ds.window_filter(@rn <= 3).sql.must_equal 'SELECT * FROM t QUALIFY (row_number() OVER (PARTITION BY a ORDER BY b DESC) <= 3)'
+  end
+
+  it "should combine multiple window_filter calls with AND when using QUALIFY" do
+    ds = @ds.with_extend{def supports_native_window_filter?; true end}
+    ds.window_filter(@rn <= 3).window_filter(Sequel[:a] > 1).sql.must_equal 'SELECT * FROM t QUALIFY ((row_number() OVER (PARTITION BY a ORDER BY b DESC) <= 3) AND (a > 1))'
+  end
+
+  it "should not modify the receiver when using QUALIFY" do
+    ds = @ds.with_extend{def supports_native_window_filter?; true end}
+    ds.window_filter(@rn <= 3)
+    ds.sql.must_equal 'SELECT * FROM t'
+    ds.opts[:window_filter].must_be_nil
+  end
+end
+
 describe Sequel::SQL::Constants do
   before do
     @db = Sequel::Database.new

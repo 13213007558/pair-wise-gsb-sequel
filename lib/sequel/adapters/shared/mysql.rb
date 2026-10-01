@@ -686,7 +686,7 @@ module Sequel
 
       Dataset.def_sql_method(self, :delete, %w'with delete from where order limit')
       Dataset.def_sql_method(self, :insert, %w'insert ignore into columns values on_duplicate_key_update returning')
-      Dataset.def_sql_method(self, :select, %w'with select distinct calc_found_rows columns from join where group having window compounds order limit lock')
+      Dataset.def_sql_method(self, :select, %w'with select distinct calc_found_rows columns from join where group having window qualify compounds order limit lock')
       Dataset.def_sql_method(self, :update, %w'with update ignore table set where order limit')
 
       include Sequel::Dataset::Replace

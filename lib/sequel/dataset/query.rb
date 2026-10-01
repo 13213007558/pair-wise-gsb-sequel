@@ -1136,6 +1136,57 @@ module Sequel
       clone(:window=>((@opts[:window]||EMPTY_ARRAY) + [[name, SQL::Window.new(opts)].freeze]).freeze)
     end
 
+    # Return a clone of the dataset filtered on the results of window functions.
+    # This operates like +where+, except the conditions are evaluated after
+    # window functions have been computed, instead of before.  This allows
+    # filtering on window function results as well as aliases defined in the
+    # SELECT list:
+    #
+    #   DB[:sales].window_filter(Sequel.function(:row_number).over(partition: :region, order: Sequel.desc(:amount)) <= 3)
+    #
+    #   DB[:sales].window_filter{sum(:amount).over(partition: :region) > 1000}
+    #
+    # On databases that support the QUALIFY clause, this uses QUALIFY:
+    #
+    #   SELECT * FROM sales QUALIFY (row_number() OVER (PARTITION BY region ORDER BY amount DESC) <= 3)
+    #
+    # On other databases, this is emulated by moving window functions in the
+    # filter into a subquery, and filtering on them in an outer query:
+    #
+    #   SELECT * FROM (
+    #     SELECT *, row_number() OVER (PARTITION BY region ORDER BY amount DESC) AS __window_filter_1
+    #     FROM sales
+    #   ) AS t1
+    #   WHERE (__window_filter_1 <= 3)
+    #
+    # Note that on databases without native support, dataset methods called
+    # after +window_filter+ (such as +order+, +limit+, and +distinct+) operate
+    # on the outer query, while methods called before +window_filter+ operate
+    # on the subquery.  Accepts the same types of conditions as +where+.
+    def window_filter(*cond, &block)
+      if supports_native_window_filter?
+        add_filter(:window_filter, cond, &block)
+      else
+        if cond == EMPTY_ARRAY && !block
+          raise Error, "must provide an argument to a filtering method if not passing a block"
+        end
+
+        cond = cond.first if cond.size == 1
+        empty = cond == OPTS || cond == EMPTY_ARRAY
+
+        if empty && !block
+          self
+        else
+          if cond.nil?
+            cond = Sequel::NULL
+          end
+          cond = nil if empty && block
+
+          _window_filter_derived(filter_expr(cond, &block))
+        end
+      end
+    end
+
     # Add a common table expression (CTE) with the given name and a dataset that defines the CTE.
     # A common table expression acts as an inline view for the query.
     #
@@ -1424,6 +1475,64 @@ module Sequel
       else
         clone(:merge_when => [hash.freeze].freeze)
       end
+    end
+
+    # Emulate filtering on the results of window functions using a derived
+    # table.  Window functions in the filter are moved to hidden columns in
+    # the subquery, and the outer query filters on them and selects all
+    # columns of the receiver except the hidden columns.
+    def _window_filter_derived(filter)
+      extractor = WindowFunctionExtractor.new
+      outer_filter = extractor.transform(filter)
+      window_functions = extractor.window_functions
+
+      ds = self
+      unless window_functions.empty?
+        columns = _window_filter_outer_columns
+        window_functions.each do |aliaz, function|
+          ds = ds.select_append(function.as(aliaz))
+        end
+      end
+
+      ds = ds.from_self(:alias=>:t1)
+      ds = ds.select(*columns) if columns
+      ds.where(outer_filter)
+    end
+
+    # The columns the outer query should select when a window filter is
+    # emulated using a derived table.  This must not include the hidden
+    # window function columns added to the subquery, so that they are not
+    # visible in the results.  Uses the aliases and columns of the current
+    # SELECT list if possible, and the actual columns of the receiver
+    # otherwise (e.g. when SELECT * or a wildcard is used).
+    def _window_filter_outer_columns
+      columns = nil
+
+      if (sel = @opts[:select]) && !sel.empty?
+        columns = sel.map do |c|
+          case c
+          when SQL::AliasedExpression
+            c.alias
+          when SQL::Identifier
+            c.value
+          when SQL::QualifiedIdentifier
+            (col = c.column).is_a?(SQL::Identifier) ? col.value : col
+          when Symbol
+            _, col, aliaz = split_symbol(c)
+            (aliaz || col).to_sym unless col == '*'
+          end
+        end
+        columns = nil if columns.empty? || columns.any?(&:nil?)
+      end
+
+      unless columns
+        columns = self.columns
+        if columns.empty?
+          raise Error, "cannot determine columns to select when using window_filter, use an explicit select list before calling window_filter"
+        end
+      end
+
+      columns
     end
 
     # Add the given filter condition. Arguments:

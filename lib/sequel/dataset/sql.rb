@@ -269,7 +269,7 @@ module Sequel
 
     def_sql_method(self, :delete, %w'delete from where')
     def_sql_method(self, :insert, %w'insert into columns values')
-    def_sql_method(self, :select, %w'with select distinct columns from join where group having compounds order limit lock')
+    def_sql_method(self, :select, %w'with select distinct columns from join where group having qualify compounds order limit lock')
     def_sql_method(self, :update, %w'update table set where')
 
     WILDCARD = LiteralString.new('*').freeze
@@ -1631,6 +1631,13 @@ module Sequel
     def select_join_sql(sql)
       if js = @opts[:join]
         js.each{|j| literal_append(sql, j)}
+      end
+    end
+
+    def select_qualify_sql(sql)
+      if f = @opts[:window_filter]
+        sql << " QUALIFY "
+        literal_append(sql, f)
       end
     end
 

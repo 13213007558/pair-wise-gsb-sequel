@@ -391,6 +391,103 @@ describe "An SQLite dataset" do
   end
 end unless DB.adapter_scheme == :sqlite && DB.opts[:setup_regexp_function]
 
+describe "SQLite::Dataset#window_filter" do
+  before do
+    @db = DB
+    @db.create_table!(:wf_sales) do
+      primary_key :id
+      String :region
+      Integer :amount
+    end
+    @ds = @db[:wf_sales]
+    @ds.multi_insert([
+      {:id=>1, :region=>'A', :amount=>10},
+      {:id=>2, :region=>'A', :amount=>20},
+      {:id=>3, :region=>'A', :amount=>30},
+      {:id=>4, :region=>'A', :amount=>40},
+      {:id=>5, :region=>'A', :amount=>100},
+      {:id=>6, :region=>'B', :amount=>5},
+      {:id=>7, :region=>'B', :amount=>50},
+      {:id=>8, :region=>'B', :amount=>60},
+    ])
+    @rn = Sequel.function(:row_number).over(:partition=>:region, :order=>Sequel.desc(:amount))
+  end
+  after do
+    @db.drop_table?(:wf_sales)
+  end
+
+  it "should filter on window function results using a derived table" do
+    ds = @ds.window_filter(@rn <= 3)
+    ds.select_order_map(:id).must_equal [3, 4, 5, 6, 7, 8]
+  end
+
+  it "should not expose hidden window function columns when using SELECT *" do
+    ds = @ds.window_filter(@rn <= 3)
+    ds.first.keys.sort_by(&:to_s).must_equal [:amount, :id, :region]
+  end
+
+  it "should compute window functions over all rows before filtering when conditions on different windows are interleaved" do
+    cum = Sequel.function(:sum, :amount).over(:partition=>:region, :order=>:amount)
+    ds = @ds.window_filter((@rn <= 3) & (cum >= 180))
+    # The cumulative sum for the amount 100 row in region A is 200 only
+    # because rows outside the top 3 (amounts 10 and 20) are included in
+    # the window input.  If the conditions were applied before the window
+    # functions were computed, the cumulative sum would be 170 and no rows
+    # would be returned.
+    ds.select_order_map(:id).must_equal [5]
+    truth = @db["SELECT id FROM (SELECT *, row_number() OVER (PARTITION BY region ORDER BY amount DESC) AS rn, sum(amount) OVER (PARTITION BY region ORDER BY amount) AS cum FROM wf_sales) AS t1 WHERE ((rn <= 3) AND (cum >= 180)) ORDER BY id"].all.map{|r| r[:id]}
+    ds.select_order_map(:id).must_equal truth
+  end
+
+  it "should support combining conditions on different windows with OR" do
+    total = Sequel.function(:sum, :amount).over(:partition=>:region)
+    ds = @ds.window_filter((@rn <= 2) | (total >= 200))
+    ds.select_order_map(:id).must_equal [1, 2, 3, 4, 5, 7, 8]
+  end
+
+  it "should support filtering on aliases defined in the SELECT list" do
+    ds = @ds.select_append(@rn.as(:rn)).window_filter(Sequel[:rn] <= 2)
+    ds.select_order_map(:id).must_equal [4, 5, 7, 8]
+    ds.first.keys.sort_by(&:to_s).must_equal [:amount, :id, :region, :rn]
+  end
+
+  it "should apply order and limit called after window_filter to the outer query" do
+    ds = @ds.window_filter(@rn <= 3).order(Sequel.desc(:amount)).limit(2)
+    ds.all.map{|r| r[:amount]}.must_equal [100, 60]
+  end
+
+  it "should apply order and limit called before window_filter to the subquery" do
+    # The inner query returns the 2 lowest amount rows of region A (ids 1
+    # and 2), whose row numbers (computed over all region A rows) are 5 and
+    # 4, so no rows match.  If the order and limit were incorrectly applied
+    # to the outer query, the result would be ids 4 and 5.
+    ds = @ds.where(:region=>'A').order(:amount).limit(2).window_filter(@rn <= 2)
+    ds.select_order_map(:id).must_equal []
+  end
+
+  it "should compute window functions over rows filtered by where called before window_filter" do
+    # The cumulative sum for region A is computed over amounts 30, 40, 100
+    # only, so only the amount 100 row reaches 170.  If the where were
+    # incorrectly applied after the window functions were computed, the
+    # amount 40 row (cumulative sum 100 over all rows) would also match.
+    cum = Sequel.function(:sum, :amount).over(:partition=>:region, :order=>:amount)
+    ds = @ds.where(Sequel[:amount] > 20).window_filter(cum >= 100)
+    ds.select_order_map(:id).must_equal [5, 8]
+  end
+
+  it "should apply distinct called after window_filter to the outer query" do
+    ds = @ds.select(:region).window_filter(@rn <= 2).distinct
+    ds.select_order_map(:region).must_equal %w[A B]
+  end
+
+  it "should not modify the receiver" do
+    ds = @ds.where(:region=>'A')
+    ds.window_filter(@rn <= 1)
+    ds.select_order_map(:id).must_equal [1, 2, 3, 4, 5]
+    ds.opts[:window_filter].must_be_nil
+  end
+end if DB.dataset.supports_window_functions?
+
 describe "SQLite::Dataset#delete" do
   before do
     DB.create_table! :items do

@@ -213,6 +213,13 @@ module Sequel
       false
     end
 
+    # Whether the dataset supports filtering on the results of window functions
+    # natively using the QUALIFY clause, false by default.  If false,
+    # Dataset#window_filter emulates support using a derived table.
+    def supports_native_window_filter?
+      false
+    end
+
     # Whether the dataset supports window functions, false by default.
     def supports_window_functions?
       false

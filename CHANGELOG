@@ -1,5 +1,7 @@
 === master
 
+* Add Dataset#window_filter for filtering on the results of window functions, using QUALIFY on databases supporting it and a derived table on other databases
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)
