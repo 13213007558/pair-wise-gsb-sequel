@@ -130,6 +130,12 @@ module Sequel
       false
     end
 
+    # Whether the dataset supports MATCH_RECOGNIZE for row pattern
+    # matching, false by default.
+    def supports_match_recognize?
+      false
+    end
+
     # Whether the MERGE statement is supported, false by default.
     def supports_merge?
       false

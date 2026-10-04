@@ -269,7 +269,7 @@ module Sequel
 
     def_sql_method(self, :delete, %w'delete from where')
     def_sql_method(self, :insert, %w'insert into columns values')
-    def_sql_method(self, :select, %w'with select distinct columns from join where group having compounds order limit lock')
+    def_sql_method(self, :select, %w'with select distinct columns from match_recognize join where group having compounds order limit lock')
     def_sql_method(self, :update, %w'update table set where')
 
     WILDCARD = LiteralString.new('*').freeze
@@ -1653,6 +1653,150 @@ module Sequel
         sql << ' FOR UPDATE'
       when String
         sql << ' ' << l
+      end
+    end
+
+    # Append the MATCH_RECOGNIZE clause to the SQL query, if the dataset
+    # uses one.
+    def select_match_recognize_sql(sql)
+      if mr = @opts[:match_recognize]
+        sql << ' MATCH_RECOGNIZE ('
+        if partition = mr[:partition]
+          sql << 'PARTITION BY '
+          expression_list_append(sql, partition)
+          sql << ' '
+        end
+        if order = mr[:order]
+          sql << 'ORDER BY '
+          expression_list_append(sql, order)
+          sql << ' '
+        end
+        if measures = mr[:measures]
+          sql << 'MEASURES '
+          expression_list_append(sql, measures)
+          sql << ' '
+        end
+        if skip = mr[:after_match_skip]
+          sql << 'AFTER MATCH SKIP ' << skip << ' '
+        end
+        sql << 'PATTERN ('
+        match_recognize_pattern_append(sql, mr[:pattern])
+        sql << ') DEFINE '
+        comma = false
+        mr[:define].each do |var, expr|
+          sql << ', ' if comma
+          sql << var << ' AS '
+          literal_append(sql, expr)
+          comma ||= true
+        end
+        sql << ')'
+      end
+    end
+
+    # Normalize the MATCH_RECOGNIZE :after_match_skip option into an SQL
+    # fragment, validating any referenced pattern variable against the
+    # DEFINE definitions.
+    def _match_recognize_after_match_skip(skip, define)
+      case skip
+      when :next_row
+        'TO NEXT ROW'
+      when :past_last_row
+        'PAST LAST ROW'
+      when Hash
+        raise(Error, 'invalid MATCH_RECOGNIZE :after_match_skip option') unless skip.length == 1
+        type, var = skip.to_a.first
+        prefix = case type
+        when :to
+          'TO '
+        when :to_first
+          'TO FIRST '
+        when :to_last
+          'TO LAST '
+        else
+          raise(Error, "invalid MATCH_RECOGNIZE :after_match_skip option: #{type.inspect}")
+        end
+        name = SQL::MatchRecognize.validate_variable_name(var)
+        unless define.key?(name)
+          raise(Error, "MATCH_RECOGNIZE AFTER MATCH SKIP variable not defined in DEFINE: #{name}")
+        end
+        "#{prefix}#{name}".freeze
+      else
+        raise(Error, "invalid MATCH_RECOGNIZE :after_match_skip option: #{skip.inspect}")
+      end
+    end
+
+    # Normalize the MATCH_RECOGNIZE :define option into a frozen hash
+    # mapping pattern variable names to their defining expressions,
+    # checking for invalid and duplicate definitions.
+    def _match_recognize_define(define)
+      unless define.is_a?(Hash) || define.is_a?(Array)
+        raise(Error, "invalid MATCH_RECOGNIZE :define option: #{define.inspect}")
+      end
+      hash = {}
+      define.each do |var, expr|
+        name = SQL::MatchRecognize.validate_variable_name(var)
+        raise(Error, "duplicate MATCH_RECOGNIZE definition for variable: #{name}") if hash.key?(name)
+        hash[name] = expr
+      end
+      hash.freeze
+    end
+
+    # Normalize the MATCH_RECOGNIZE :measures option into a frozen array
+    # of SQL::AliasedExpression instances, checking for duplicate aliases.
+    def _match_recognize_measures(measures)
+      pairs = measures.is_a?(Hash) ? measures.to_a : measures
+      seen = {}
+      pairs.map do |pair|
+        ae = pair.is_a?(SQL::AliasedExpression) ? pair : SQL::AliasedExpression.new(pair[1], pair[0])
+        raise(Error, "duplicate MATCH_RECOGNIZE measure: #{ae.alias}") if seen.key?(ae.alias)
+        seen[ae.alias] = true
+        ae
+      end.freeze
+    end
+
+    # Append the SQL fragment for the given MATCH_RECOGNIZE row pattern
+    # element to the SQL string.
+    def match_recognize_pattern_append(sql, element)
+      case element
+      when SQL::MatchRecognize::Variable
+        sql << element.name
+      when SQL::MatchRecognize::Concat
+        space = false
+        element.elements.each do |el|
+          sql << ' ' if space
+          if el.is_a?(SQL::MatchRecognize::Alternate)
+            sql << '('
+            match_recognize_pattern_append(sql, el)
+            sql << ')'
+          else
+            match_recognize_pattern_append(sql, el)
+          end
+          space ||= true
+        end
+      when SQL::MatchRecognize::Alternate
+        bar = false
+        element.elements.each do |el|
+          sql << ' | ' if bar
+          match_recognize_pattern_append(sql, el)
+          bar ||= true
+        end
+      when SQL::MatchRecognize::Group
+        sql << '('
+        match_recognize_pattern_append(sql, element.element)
+        sql << ')'
+      when SQL::MatchRecognize::Quantified
+        child = element.element
+        case child
+        when SQL::MatchRecognize::Concat, SQL::MatchRecognize::Alternate
+          sql << '('
+          match_recognize_pattern_append(sql, child)
+          sql << ')'
+        else
+          match_recognize_pattern_append(sql, child)
+        end
+        sql << element.quantifier
+      else
+        raise(Error, "invalid MATCH_RECOGNIZE pattern element: #{element.inspect}")
       end
     end
 

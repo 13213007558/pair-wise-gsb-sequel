@@ -2013,6 +2013,256 @@ module Sequel
       to_s_method :window_sql, '@opts'
     end
 
+    # +MatchRecognize+ is a builder and namespace for Oracle-style
+    # +MATCH_RECOGNIZE+ row patterns, used by Dataset#match_recognize.
+    #
+    # You can build row patterns using +[]+ to create pattern variables,
+    # and the +++, +|+, +repeat+, +zero_or_more+, +one_or_more+, +optional+,
+    # and +group+ methods to combine them:
+    #
+    #   mr = Sequel::SQL::MatchRecognize
+    #   mr[:A] + mr[:B].repeat(1..3) + mr[:C]         # A B{1,3} C
+    #   mr[:A] | mr[:B]                               # A | B
+    #   mr.group(mr[:A] + mr[:B]).one_or_more         # (A B)+
+    module MatchRecognize
+      # Pattern for valid row pattern variable names (unquoted SQL identifiers).
+      VARIABLE_NAME = /\A[A-Za-z][A-Za-z0-9_]*\z/.freeze
+
+      # Base class for MATCH_RECOGNIZE row pattern elements.
+      class PatternElement < Expression
+        # Return a row pattern matching this element followed by the
+        # +other+ element (row pattern concatenation):
+        #
+        #   mr[:A] + mr[:B] # A B
+        def +(other)
+          Concat.concat(self, MatchRecognize.pattern_element(other))
+        end
+
+        # Return a row pattern matching either this element or the
+        # +other+ element (row pattern alternation):
+        #
+        #   mr[:A] | mr[:B] # A | B
+        def |(other)
+          Alternate.alternate(self, MatchRecognize.pattern_element(other))
+        end
+
+        # Return a row pattern matching this element repeated between +min+
+        # and +max+ times.  +min+ can be a Range, in which case +max+ should
+        # not be given.  If +reluctant+ is true, use a reluctant (non-greedy)
+        # quantifier:
+        #
+        #   mr[:A].repeat(1..3)             # A{1,3}
+        #   mr[:A].repeat(2)                # A{2}
+        #   mr[:A].repeat(2, nil)           # A{2,}
+        #   mr[:A].repeat(1, 3, reluctant: true) # A{1,3}?
+        def repeat(min=nil, max=(no_max = true; nil), reluctant: false)
+          if min.is_a?(Range)
+            raise(Error, 'cannot provide both a range and a maximum when using repeat') unless no_max
+            max = min.end
+            max -= 1 if max && min.exclude_end?
+            min = min.begin
+          elsif no_max
+            max = min
+          end
+          raise(Error, 'must provide a minimum and/or maximum when using repeat') if min.nil? && max.nil?
+          [min, max].each do |bound|
+            unless bound.nil? || (bound.is_a?(Integer) && bound >= 0)
+              raise(Error, "invalid MATCH_RECOGNIZE pattern quantifier bound: #{bound.inspect}")
+            end
+          end
+          raise(Error, "MATCH_RECOGNIZE pattern quantifier minimum (#{min}) is greater than maximum (#{max})") if min && max && min > max
+
+          quantifier = if min == 0 && max.nil?
+            '*'
+          elsif min == 1 && max.nil?
+            '+'
+          elsif min == 0 && max == 1
+            '?'
+          elsif min == max
+            "{#{min}}"
+          elsif max.nil?
+            "{#{min},}"
+          elsif min.nil?
+            "{0,#{max}}"
+          else
+            "{#{min},#{max}}"
+          end
+          quantifier = "#{quantifier}?" if reluctant
+          Quantified.new(self, quantifier)
+        end
+
+        # Return a row pattern matching this element zero or more times:
+        #
+        #   mr[:A].zero_or_more # A*
+        def zero_or_more(reluctant: false)
+          Quantified.new(self, reluctant ? '*?' : '*')
+        end
+
+        # Return a row pattern matching this element one or more times:
+        #
+        #   mr[:A].one_or_more # A+
+        def one_or_more(reluctant: false)
+          Quantified.new(self, reluctant ? '+?' : '+')
+        end
+
+        # Return a row pattern matching this element zero or one times:
+        #
+        #   mr[:A].optional # A?
+        def optional(reluctant: false)
+          Quantified.new(self, reluctant ? '??' : '?')
+        end
+      end
+
+      # A row pattern variable, referencing a variable defined in the
+      # MATCH_RECOGNIZE DEFINE clause.
+      class Variable < PatternElement
+        # The name of the pattern variable.
+        attr_reader :name
+
+        # Validate the variable name and set it.
+        def initialize(name)
+          @name = MatchRecognize.validate_variable_name(name)
+          freeze
+        end
+
+        # The variable names used by this element.
+        def variables
+          [name]
+        end
+      end
+
+      # A row pattern matching the concatenation of the elements.
+      class Concat < PatternElement
+        # The pattern elements to concatenate.
+        attr_reader :elements
+
+        # Set the pattern elements to concatenate.
+        def initialize(elements)
+          @elements = elements.freeze
+          freeze
+        end
+
+        # Return a Concat pattern matching +first+ followed by +second+,
+        # flattening nested Concat elements.
+        def self.concat(first, second)
+          elements = []
+          elements.concat(first.is_a?(Concat) ? first.elements : [first])
+          elements.concat(second.is_a?(Concat) ? second.elements : [second])
+          new(elements)
+        end
+
+        # The variable names used by this element.
+        def variables
+          elements.flat_map{|element| element.variables}.uniq
+        end
+      end
+
+      # A row pattern matching any of the elements (alternation).
+      class Alternate < PatternElement
+        # The alternative pattern elements.
+        attr_reader :elements
+
+        # Set the alternative pattern elements.
+        def initialize(elements)
+          @elements = elements.freeze
+          freeze
+        end
+
+        # Return an Alternate pattern matching +first+ or +second+,
+        # flattening nested Alternate elements.
+        def self.alternate(first, second)
+          elements = []
+          elements.concat(first.is_a?(Alternate) ? first.elements : [first])
+          elements.concat(second.is_a?(Alternate) ? second.elements : [second])
+          new(elements)
+        end
+
+        # The variable names used by this element.
+        def variables
+          elements.flat_map{|element| element.variables}.uniq
+        end
+      end
+
+      # A grouped (parenthesized) row pattern element.
+      class Group < PatternElement
+        # The grouped pattern element.
+        attr_reader :element
+
+        # Set the grouped pattern element.
+        def initialize(element)
+          @element = element
+          freeze
+        end
+
+        # The variable names used by this element.
+        def variables
+          element.variables
+        end
+      end
+
+      # A row pattern element with a quantifier.
+      class Quantified < PatternElement
+        # The pattern element being quantified.
+        attr_reader :element
+
+        # The quantifier SQL fragment (e.g. <tt>{1,3}</tt>, +*+, +?+).
+        attr_reader :quantifier
+
+        # Set the pattern element and quantifier.
+        def initialize(element, quantifier)
+          @element = element
+          @quantifier = quantifier
+          freeze
+        end
+
+        # The variable names used by this element.
+        def variables
+          element.variables
+        end
+      end
+
+      # Return a row pattern variable with the given name:
+      #
+      #   Sequel::SQL::MatchRecognize[:A] # A
+      def self.[](name)
+        Variable.new(name)
+      end
+
+      # Return a grouped (parenthesized) row pattern for the given element:
+      #
+      #   Sequel::SQL::MatchRecognize.group(Sequel::SQL::MatchRecognize[:A] + :B) # (A B)
+      def self.group(element)
+        Group.new(pattern_element(element))
+      end
+
+      # Convert the given object to a row pattern element.  Symbols and
+      # Strings become pattern variables, arrays become concatenations,
+      # and PatternElement instances are returned as is.
+      def self.pattern_element(object)
+        case object
+        when PatternElement
+          object
+        when Symbol, String
+          Variable.new(object)
+        when Array
+          raise(Error, 'cannot use an empty array as a MATCH_RECOGNIZE pattern') if object.empty?
+          Concat.new(object.map{|o| pattern_element(o)})
+        else
+          raise(Error, "invalid MATCH_RECOGNIZE pattern element: #{object.inspect}")
+        end
+      end
+
+      # Validate that the given name is a valid row pattern variable name,
+      # returning the name as a frozen string.
+      def self.validate_variable_name(name)
+        name = name.to_s
+        unless name =~ VARIABLE_NAME
+          raise(Error, "invalid MATCH_RECOGNIZE pattern variable: #{name}")
+        end
+        name.freeze
+      end
+    end
+
     # A +Wrapper+ is a simple way to wrap an existing object so that it supports
     # the Sequel DSL.
     class Wrapper < GenericExpression

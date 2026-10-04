@@ -5681,6 +5681,135 @@ describe "Custom ASTTransformer" do
   end
 end
 
+describe "Dataset#match_recognize" do
+  before do
+    @db = Sequel.mock
+    @db.extend_datasets{def supports_match_recognize?; true end}
+    @ds = @db[:events]
+    @mr = Sequel::SQL::MatchRecognize
+  end
+
+  it "should support MATCH_RECOGNIZE with partition, order, measures, pattern, and define" do
+    @ds.match_recognize(
+      :partition=>:user_id,
+      :order=>:event_at,
+      :measures=>{:start_price=>Sequel.function(:last, Sequel[:A][:price])},
+      :pattern=>@mr[:A] + @mr[:B].repeat(1..3) + @mr[:C],
+      :define=>{
+        :A=>Sequel.expr{price > 100},
+        :B=>Sequel.expr{price < Sequel[:A][:price]},
+        :C=>Sequel.expr{price > 100}}
+    ).sql.must_equal 'SELECT * FROM events MATCH_RECOGNIZE (PARTITION BY user_id ORDER BY event_at MEASURES last(A.price) AS start_price PATTERN (A B{1,3} C) DEFINE A AS (price > 100), B AS (price < A.price), C AS (price > 100))'
+  end
+
+  it "should support symbols and arrays for simple patterns" do
+    define = {:A=>Sequel.expr{price > 0}, :B=>Sequel.expr{price > 0}, :C=>Sequel.expr{price > 0}}
+    @ds.match_recognize(:pattern=>:A, :define=>{:A=>Sequel.expr{price > 0}}).sql.must_equal 'SELECT * FROM events MATCH_RECOGNIZE (PATTERN (A) DEFINE A AS (price > 0))'
+    @ds.match_recognize(:pattern=>[:A, :B, :C], :define=>define).sql.must_equal 'SELECT * FROM events MATCH_RECOGNIZE (PATTERN (A B C) DEFINE A AS (price > 0), B AS (price > 0), C AS (price > 0))'
+  end
+
+  it "should support nested patterns with grouping, alternation, and quantifiers" do
+    define = {}
+    [:A, :B, :C, :D, :E, :F, :G].each{|v| define[v] = Sequel.expr{price > 0}}
+    pattern = @mr[:A] + @mr.group(@mr[:B] | @mr[:C] + @mr[:D]).repeat(2) + @mr[:E].optional + @mr[:F].zero_or_more + @mr[:G].one_or_more(:reluctant=>true)
+    @ds.match_recognize(:pattern=>pattern, :define=>define).sql.must_equal 'SELECT * FROM events MATCH_RECOGNIZE (PATTERN (A (B | C D){2} E? F* G+?) DEFINE A AS (price > 0), B AS (price > 0), C AS (price > 0), D AS (price > 0), E AS (price > 0), F AS (price > 0), G AS (price > 0))'
+  end
+
+  it "should parenthesize concatenated and alternated patterns when quantified" do
+    define = {}
+    [:A, :B, :C, :D].each{|v| define[v] = Sequel.expr{price > 0}}
+    pattern = (@mr[:A] + @mr[:B]).repeat(1..2) + (@mr[:C] | @mr[:D])
+    @ds.match_recognize(:pattern=>pattern, :define=>define).sql.must_equal 'SELECT * FROM events MATCH_RECOGNIZE (PATTERN ((A B){1,2} (C | D)) DEFINE A AS (price > 0), B AS (price > 0), C AS (price > 0), D AS (price > 0))'
+  end
+
+  it "should support quantifier forms" do
+    q = proc{|pat| @ds.match_recognize(:pattern=>pat, :define=>{:A=>Sequel.expr{price > 0}}).sql[/PATTERN \((.*)\) DEFINE/, 1]}
+    q[@mr[:A].repeat(2)].must_equal 'A{2}'
+    q[@mr[:A].repeat(2, nil)].must_equal 'A{2,}'
+    q[@mr[:A].repeat(1..3)].must_equal 'A{1,3}'
+    q[@mr[:A].repeat(1...3)].must_equal 'A{1,2}'
+    q[@mr[:A].repeat(1, 3, :reluctant=>true)].must_equal 'A{1,3}?'
+    q[@mr[:A].zero_or_more].must_equal 'A*'
+    q[@mr[:A].zero_or_more(:reluctant=>true)].must_equal 'A*?'
+    q[@mr[:A].one_or_more].must_equal 'A+'
+    q[@mr[:A].one_or_more(:reluctant=>true)].must_equal 'A+?'
+    q[@mr[:A].optional].must_equal 'A?'
+    q[@mr[:A].optional(:reluctant=>true)].must_equal 'A??'
+  end
+
+  it "should support bound values in define conditions and measures" do
+    threshold = 100
+    @ds.match_recognize(
+      :order=>:event_at,
+      :measures=>{:avg_price=>Sequel.function(:avg, Sequel[:B][:price])},
+      :pattern=>[:A, :B],
+      :define=>{
+        :A=>Sequel.lit('price > ?', threshold),
+        :B=>Sequel.expr{price < Sequel[:A][:price] - 10}}
+    ).sql.must_equal 'SELECT * FROM events MATCH_RECOGNIZE (ORDER BY event_at MEASURES avg(B.price) AS avg_price PATTERN (A B) DEFINE A AS price > 100, B AS (price < (A.price - 10)))'
+  end
+
+  it "should support after_match_skip options" do
+    define = {:A=>Sequel.expr{price > 0}, :B=>Sequel.expr{price > 0}}
+    base = {:pattern=>[:A, :B], :define=>define}
+    prefix = 'SELECT * FROM events MATCH_RECOGNIZE ('
+    suffix = ' PATTERN (A B) DEFINE A AS (price > 0), B AS (price > 0))'
+    @ds.match_recognize(base.merge(:after_match_skip=>:next_row)).sql.must_equal "#{prefix}AFTER MATCH SKIP TO NEXT ROW#{suffix}"
+    @ds.match_recognize(base.merge(:after_match_skip=>:past_last_row)).sql.must_equal "#{prefix}AFTER MATCH SKIP PAST LAST ROW#{suffix}"
+    @ds.match_recognize(base.merge(:after_match_skip=>{:to=>:A})).sql.must_equal "#{prefix}AFTER MATCH SKIP TO A#{suffix}"
+    @ds.match_recognize(base.merge(:after_match_skip=>{:to_first=>:A})).sql.must_equal "#{prefix}AFTER MATCH SKIP TO FIRST A#{suffix}"
+    @ds.match_recognize(base.merge(:after_match_skip=>{:to_last=>:B})).sql.must_equal "#{prefix}AFTER MATCH SKIP TO LAST B#{suffix}"
+  end
+
+  it "should quote measure aliases and expression identifiers when quoting identifiers" do
+    ds = @ds.with_quote_identifiers(true)
+    ds.match_recognize(
+      :order=>:event_at,
+      :measures=>{:sp=>Sequel.function(:last, Sequel[:A][:price])},
+      :pattern=>:A,
+      :define=>{:A=>Sequel.expr{price > 100}}
+    ).sql.must_equal 'SELECT * FROM "events" MATCH_RECOGNIZE (ORDER BY "event_at" MEASURES last("A"."price") AS "sp" PATTERN (A) DEFINE A AS ("price" > 100))'
+  end
+
+  it "should raise an error for datasets that do not support MATCH_RECOGNIZE" do
+    proc{Sequel.mock[:events].match_recognize(:pattern=>:A, :define=>{:A=>true})}.must_raise Sequel::Error
+  end
+
+  it "should raise an error without a pattern or define" do
+    proc{@ds.match_recognize(:define=>{:A=>true})}.must_raise Sequel::Error
+    proc{@ds.match_recognize(:pattern=>:A)}.must_raise Sequel::Error
+  end
+
+  it "should raise an error for pattern variables not defined in DEFINE" do
+    proc{@ds.match_recognize(:pattern=>@mr[:A] + @mr[:B], :define=>{:A=>true})}.must_raise Sequel::Error
+  end
+
+  it "should raise an error for duplicate DEFINE definitions" do
+    proc{@ds.match_recognize(:pattern=>:A, :define=>[[:A, true], [:A, false]])}.must_raise Sequel::Error
+  end
+
+  it "should raise an error for duplicate measures" do
+    proc{@ds.match_recognize(:pattern=>:A, :define=>{:A=>true}, :measures=>[[:x, 1], [:x, 2]])}.must_raise Sequel::Error
+  end
+
+  it "should raise an error for invalid pattern variable names" do
+    proc{@mr[:'1A']}.must_raise Sequel::Error
+    proc{@ds.match_recognize(:pattern=>:A, :define=>{:'A B'=>true})}.must_raise Sequel::Error
+  end
+
+  it "should raise an error for invalid after_match_skip options" do
+    proc{@ds.match_recognize(:pattern=>:A, :define=>{:A=>true}, :after_match_skip=>:bogus)}.must_raise Sequel::Error
+    proc{@ds.match_recognize(:pattern=>:A, :define=>{:A=>true}, :after_match_skip=>{:to=>:B})}.must_raise Sequel::Error
+  end
+
+  it "should raise an error for invalid quantifiers" do
+    proc{@mr[:A].repeat}.must_raise Sequel::Error
+    proc{@mr[:A].repeat(3, 1)}.must_raise Sequel::Error
+    proc{@mr[:A].repeat(-1)}.must_raise Sequel::Error
+    proc{@mr[:A].repeat(1.5)}.must_raise Sequel::Error
+  end
+end
+
 describe "Dataset#returning" do
   before do
     @db = Sequel.mock(:fetch=>proc{|s| {:foo=>s}})

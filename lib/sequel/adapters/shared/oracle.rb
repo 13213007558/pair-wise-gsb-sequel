@@ -334,7 +334,7 @@ module Sequel
 
       include(Module.new do
         Sequel.set_temp_name(self){"Sequel::Oracle::DatasetMethods::_SQLMethods"}
-        Dataset.def_sql_method(self, :select, %w'with select distinct columns from join where group having compounds order limit lock')
+        Dataset.def_sql_method(self, :select, %w'with select distinct columns from match_recognize join where group having compounds order limit lock')
       end)
 
       def complex_expression_sql_append(sql, op, args)
@@ -494,6 +494,11 @@ module Sequel
         false
       end
     
+      # Oracle supports MATCH_RECOGNIZE for row pattern matching.
+      def supports_match_recognize?
+        true
+      end
+
       # Oracle supports MERGE
       def supports_merge?
         true

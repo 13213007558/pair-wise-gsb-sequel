@@ -690,6 +690,76 @@ module Sequel
       clone(:lock => style)
     end
     
+    # Add an Oracle-style MATCH_RECOGNIZE clause to the query, used for
+    # row pattern matching.  This raises an +Error+ if the dataset does not
+    # support MATCH_RECOGNIZE (currently only Oracle), if the pattern uses
+    # variables not defined in DEFINE, or if variables are defined more
+    # than once.
+    #
+    #   mr = Sequel::SQL::MatchRecognize
+    #   DB[:events].match_recognize(
+    #     partition: :user_id,
+    #     order: :event_at,
+    #     measures: {start_price: Sequel.function(:last, Sequel[:A][:price])},
+    #     pattern: mr[:A] + mr[:B].repeat(1..3) + mr[:C],
+    #     define: {
+    #       A: Sequel.expr{price > 100},
+    #       B: Sequel.expr{price < Sequel[:A][:price]},
+    #       C: Sequel.expr{price > 100}},
+    #     after_match_skip: :next_row)
+    #   # SELECT * FROM events MATCH_RECOGNIZE (
+    #   #   PARTITION BY user_id ORDER BY event_at
+    #   #   MEASURES last(A.price) AS start_price
+    #   #   AFTER MATCH SKIP TO NEXT ROW
+    #   #   PATTERN (A B{1,3} C)
+    #   #   DEFINE A AS (price > 100), B AS (price < A.price), C AS (price > 100))
+    #
+    # Options:
+    # :after_match_skip :: Where to resume matching after a match is found.
+    #                      Values:
+    #                      :next_row :: AFTER MATCH SKIP TO NEXT ROW
+    #                      :past_last_row :: AFTER MATCH SKIP PAST LAST ROW
+    #                      <tt>{to: :var}</tt> :: AFTER MATCH SKIP TO var
+    #                      <tt>{to_first: :var}</tt> :: AFTER MATCH SKIP TO FIRST var
+    #                      <tt>{to_last: :var}</tt> :: AFTER MATCH SKIP TO LAST var
+    # :define :: The row pattern definitions (required).  A hash or an array
+    #            of pairs mapping pattern variables to the condition that a
+    #            row must meet to be mapped to the variable.  Conditions use
+    #            the standard Sequel expression rules.
+    # :measures :: The MATCH_RECOGNIZE measures.  A hash or an array of pairs
+    #              mapping column aliases to expressions, which use the
+    #              standard Sequel expression rules.
+    # :order :: The order rows should be processed in when pattern matching.
+    # :partition :: Expressions to partition the rows by, similar to a
+    #               window function partition.
+    # :pattern :: The row pattern (required).  Generally built using the
+    #             Sequel::SQL::MatchRecognize builder, though a Symbol can
+    #             be used for a single variable, and an array can be used
+    #             for a simple concatenation of variables.
+    def match_recognize(opts=OPTS)
+      raise(Error, 'This dataset does not support MATCH_RECOGNIZE') unless supports_match_recognize?
+      raise(Error, 'MATCH_RECOGNIZE requires a :pattern option') unless pattern = opts[:pattern]
+      raise(Error, 'MATCH_RECOGNIZE requires a :define option') unless define = opts[:define]
+
+      pattern = SQL::MatchRecognize.pattern_element(pattern)
+      define = _match_recognize_define(define)
+      undefined = pattern.variables - define.keys
+      unless undefined.empty?
+        raise(Error, "MATCH_RECOGNIZE pattern variable(s) not defined in DEFINE: #{undefined.join(', ')}")
+      end
+
+      mr = {
+        :pattern=>pattern,
+        :define=>define,
+        :partition=>opts[:partition] && Array(opts[:partition]).freeze,
+        :order=>opts[:order] && Array(opts[:order]).freeze,
+        :measures=>opts[:measures] && _match_recognize_measures(opts[:measures]),
+        :after_match_skip=>opts[:after_match_skip] && _match_recognize_after_match_skip(opts[:after_match_skip], define)
+      }
+      mr.delete_if{|_, v| v.nil?}
+      clone(:match_recognize=>mr.freeze)
+    end
+
     # Return a dataset with a WHEN MATCHED THEN DELETE clause added to the
     # MERGE statement.  If a block is passed, treat it as a virtual row and
     # use it as additional conditions for the match.
