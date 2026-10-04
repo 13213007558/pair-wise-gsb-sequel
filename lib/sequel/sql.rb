@@ -649,6 +649,16 @@ module Sequel
         SQL::QualifiedIdentifier.new(qualifier, identifier)
       end
 
+      # Return an Oracle-style SQL row pattern for use with Dataset#match_recognize.
+      # If a block is given, it is called with a row pattern builder, allowing the
+      # use of Ruby operators for concatenation (+ or >>) and alternation (|):
+      #
+      #   Sequel.row_pattern { a + b.one_to_three + c }
+      #   # PATTERN (A B{1,3} C)
+      def row_pattern(*args, &block)
+        SQL::RowPattern.create(*args, &block)
+      end
+
       # Return an <tt>SQL::Subscript</tt> with the given arguments, representing an
       # SQL array access.
       #
@@ -1707,6 +1717,374 @@ module Sequel
       end
 
       to_s_method :ordered_expression_sql
+    end
+
+    # Builders and AST nodes for Oracle SQL row patterns.
+    module RowPattern
+      def self.create(*args, &block)
+        builder = Builder.new
+        node = if block
+          raise Error, "cannot provide both arguments and a block to Sequel.row_pattern" unless args.empty?
+          if block.arity == 0
+            builder.instance_exec(&block)
+          else
+            block.call(builder)
+          end
+        elsif args.length == 1
+          node(args.first)
+        else
+          raise Error, "must provide either an argument or a block to Sequel.row_pattern"
+        end
+        raise Error, "MATCH_RECOGNIZE pattern cannot be empty" unless node.is_a?(Node)
+        node
+      end
+
+      class << self
+        private
+
+        def node(value)
+          case value
+          when Node
+            value
+          when Symbol, Identifier
+            Variable.new(value)
+          when Array
+            Concatenation.new(*value)
+          else
+            raise Error, "unsupported MATCH_RECOGNIZE pattern: #{value.inspect}"
+          end
+        end
+      end
+
+      class Node < Expression
+        def +(other)
+          Concatenation.new(self, RowPattern.create(other))
+        end
+        alias >> +
+
+        def |(other)
+          Alternation.new(self, RowPattern.create(other))
+        end
+
+        def maybe
+          Repetition.new(self, :maybe)
+        end
+        alias optional maybe
+
+        def any_number
+          Repetition.new(self, :any)
+        end
+        alias zero_or_more any_number
+
+        def one_or_more
+          Repetition.new(self, :one_or_more)
+        end
+
+        def one_to_three
+          times(1..3)
+        end
+
+        def times(count)
+          Repetition.new(self, count)
+        end
+        alias repeat times
+
+        def group
+          Grouping.new(self)
+        end
+
+        def variables
+          []
+        end
+      end
+
+      class Variable < Node
+        attr_reader :name
+
+        def initialize(name)
+          name = name.value if name.is_a?(Identifier)
+          name = name.is_a?(String) ? name : name.to_sym
+          raise Error, "invalid MATCH_RECOGNIZE pattern variable: #{name.inspect}" unless name =~ MatchRecognize::IDENTIFIER_FORMAT
+          @name = name.to_s.freeze
+          freeze
+        end
+
+        def variables
+          [name]
+        end
+
+        to_s_method :row_pattern_variable_sql
+      end
+
+      class Concatenation < Node
+        attr_reader :children
+
+        def initialize(*children)
+          @children = flatten_children(children).freeze
+          raise Error, "MATCH_RECOGNIZE concatenation requires at least two terms" if @children.length < 2
+          freeze
+        end
+
+        def variables
+          children.flat_map(&:variables)
+        end
+
+        to_s_method :row_pattern_concatenation_sql
+
+        private
+
+        def flatten_children(children)
+          children.flat_map do |child|
+            child = RowPattern.create(child)
+            child.is_a?(Concatenation) ? child.children : [child]
+          end
+        end
+      end
+
+      class Alternation < Node
+        attr_reader :children
+
+        def initialize(*children)
+          @children = flatten_children(children).freeze
+          raise Error, "MATCH_RECOGNIZE alternation requires at least two branches" if @children.length < 2
+          freeze
+        end
+
+        def variables
+          children.flat_map(&:variables)
+        end
+
+        to_s_method :row_pattern_alternation_sql
+
+        private
+
+        def flatten_children(children)
+          children.flat_map do |child|
+            child = RowPattern.create(child)
+            child.is_a?(Alternation) ? child.children : [child]
+          end
+        end
+      end
+
+      class Grouping < Node
+        attr_reader :child
+
+        def initialize(child)
+          @child = RowPattern.create(child)
+          freeze
+        end
+
+        def group
+          self
+        end
+
+        def variables
+          child.variables
+        end
+
+        to_s_method :row_pattern_grouping_sql
+      end
+
+      class Repetition < Node
+        attr_reader :child, :quantifier
+
+        def initialize(child, quantifier)
+          @child = RowPattern.create(child)
+          @quantifier = normalize_quantifier(quantifier)
+          freeze
+        end
+
+        def variables
+          child.variables
+        end
+
+        def group
+          self
+        end
+
+        to_s_method :row_pattern_repetition_sql
+
+        private
+
+        def normalize_quantifier(quantifier)
+          case quantifier
+          when :maybe, :optional, :zero_or_one, '?'
+            :maybe
+          when :any, :zero_or_more, :*
+            :any
+          when :one_or_more, :+
+            :one_or_more
+          when Integer
+            raise Error, "MATCH_RECOGNIZE pattern quantifier must be positive" unless quantifier > 0
+            quantifier
+          when Range
+            first = quantifier.begin
+            last = quantifier.end
+            if first && last
+              raise Error, "MATCH_RECOGNIZE pattern quantifier range is invalid" unless first >= 0 && last >= first
+              (first..last)
+            elsif last
+              last -= 1 if quantifier.exclude_end?
+              raise Error, "MATCH_RECOGNIZE pattern quantifier range is invalid" unless last >= 0
+              (0..last)
+            else
+              raise Error, "unsupported MATCH_RECOGNIZE pattern quantifier: #{quantifier.inspect}"
+            end
+          else
+            raise Error, "unsupported MATCH_RECOGNIZE pattern quantifier: #{quantifier.inspect}"
+          end
+        end
+      end
+
+      class Builder < BasicObject
+        def method_missing(name, *args)
+          if args.empty? && name.to_s =~ MatchRecognize::IDENTIFIER_FORMAT
+            Variable.new(name)
+          else
+            raise ::Sequel::Error, "invalid MATCH_RECOGNIZE pattern variable: #{name.inspect}"
+          end
+        end
+
+        def respond_to_missing?(name, include_private=false)
+          (name.to_s =~ MatchRecognize::IDENTIFIER_FORMAT) ? true : super
+        end
+      end
+    end
+
+    # Represents an Oracle MATCH_RECOGNIZE clause.
+    class MatchRecognize < Expression
+      IDENTIFIER_FORMAT = /\A[A-Za-z][A-Za-z0-9_$#]*\z/.freeze
+
+      SKIP_STRATEGIES = {
+        :past_last_row => 'PAST LAST ROW',
+        :to_next_row => 'TO NEXT ROW'
+      }.freeze
+
+      attr_reader :pattern, :define, :measures, :partition, :order, :after_match_skip
+
+      def initialize(opts=OPTS)
+        if opts.is_a?(MatchRecognize)
+          @pattern = opts.pattern
+          @define = opts.define
+          @measures = opts.measures
+          @partition = opts.partition
+          @order = opts.order
+          @after_match_skip = opts.after_match_skip
+          freeze
+          return
+        end
+
+        opts = Hash[opts]
+        partition = opts[:partition] || opts[:partition_by]
+        order = opts[:order] || opts[:order_by]
+        pattern = RowPattern.create(opts[:pattern])
+        measures = alias_pairs(opts[:measures], :measures)
+        define = alias_pairs(opts[:define], :define)
+        after_match_skip = normalize_skip_strategy(opts[:after_match_skip] || opts[:after_match])
+
+        known_keys = [:pattern, :define, :measures, :partition, :partition_by,
+          :order, :order_by, :after_match_skip, :after_match]
+        unknown_keys = opts.keys - known_keys
+        raise Error, "unsupported MATCH_RECOGNIZE options: #{unknown_keys.map(&:inspect).join(', ')}" unless unknown_keys.empty?
+        raise Error, "MATCH_RECOGNIZE requires at least one DEFINE variable" if define.empty?
+
+        declared = define.map(&:first)
+        pattern.variables.uniq.each do |variable|
+          raise Error, "undeclared MATCH_RECOGNIZE pattern variable: #{variable}" unless declared.include?(variable)
+        end
+        if after_match_skip && after_match_skip[0] == :to && !declared.include?(after_match_skip[1])
+          raise Error, "undeclared MATCH_RECOGNIZE pattern variable: #{after_match_skip[1]}"
+        end
+
+        @pattern = pattern
+        @define = define
+        @measures = measures
+        @partition = Array(partition).freeze
+        @order = Array(order).freeze
+        @after_match_skip = after_match_skip
+        freeze
+      end
+
+      def sequel_ast_transform(transformer)
+        self.class.new(
+          :pattern => @pattern,
+          :define => @define.map{|name, expression| [name, transformer.call(expression)]},
+          :measures => @measures.map{|name, expression| [name, transformer.call(expression)]},
+          :partition => transformer.call(@partition),
+          :order => transformer.call(@order),
+          :after_match_skip => @after_match_skip
+        )
+      end
+
+      to_s_method :match_recognize_sql
+
+      private
+
+      def alias_pairs(value, type)
+        pairs = case value
+        when nil
+          []
+        when Hash
+          value.to_a
+        when Array
+          value
+        else
+          raise Error, "MATCH_RECOGNIZE #{type} must be a hash or array of pairs"
+        end
+
+        unless pairs.all?{|pair| pair.is_a?(Array) && pair.length == 2}
+          raise Error, "MATCH_RECOGNIZE #{type} must be a hash or array of pairs"
+        end
+
+        pairs = pairs.map do |name, expression|
+          [pattern_identifier(name), ::Sequel.expr(expression)]
+        end
+
+        if type == :define
+          names = pairs.map(&:first)
+          names.each do |name|
+            raise Error, "duplicate MATCH_RECOGNIZE pattern variable: #{name}" if names.count(name) > 1
+          end
+        end
+
+        pairs.freeze
+      end
+
+      def normalize_skip_strategy(value)
+        case value
+        when nil
+          nil
+        when Symbol, String
+          symbol = value.to_sym
+          key = symbol.to_s[/\Askip_(.*)\z/, 1]
+          key = key.to_sym if key
+          if symbol == :show_all_rows || key == :show_all_rows
+            [:show, 'SHOW ALL ROWS'].freeze
+          else
+            strategy = SKIP_STRATEGIES[symbol] || SKIP_STRATEGIES[key]
+            raise Error, "unsupported MATCH_RECOGNIZE AFTER MATCH SKIP strategy: #{value.inspect}" unless strategy
+            [:skip, strategy.freeze].freeze
+          end
+        when Hash
+          target = value[:to] || value[:target] || value[:variable]
+          raise Error, "MATCH_RECOGNIZE AFTER MATCH SKIP requires :to or :target" unless target
+          [:to, pattern_identifier(target)].freeze
+        when Array
+          unless value.length == 2 && value.first.to_s =~ /\A(skip_)?to(_next_row)?\z/
+            raise Error, "unsupported MATCH_RECOGNIZE AFTER MATCH SKIP strategy: #{value.inspect}"
+          end
+          [:to, pattern_identifier(value.last)].freeze
+        else
+          raise Error, "unsupported MATCH_RECOGNIZE AFTER MATCH SKIP strategy: #{value.inspect}"
+        end
+      end
+
+      def pattern_identifier(value)
+        value = value.value if value.is_a?(Identifier)
+        value = value.is_a?(String) ? value : value.to_sym
+        raise Error, "invalid MATCH_RECOGNIZE pattern variable: #{value.inspect}" unless value =~ IDENTIFIER_FORMAT
+        value.to_s.freeze
+      end
     end
 
     # Represents a qualified identifier (column with table or table with schema).

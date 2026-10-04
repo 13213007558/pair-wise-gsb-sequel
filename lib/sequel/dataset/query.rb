@@ -42,7 +42,7 @@ module Sequel
     QUERY_METHODS = ((<<-METHS).split.map(&:to_sym) + JOIN_METHODS).freeze
       add_graph_aliases distinct except exclude exclude_having
       filter for_update from from_self graph grep group group_and_count group_append group_by having intersect invert
-      limit lock_style naked offset or order order_append order_by order_more order_prepend qualify
+      limit lock_style match_recognize naked offset or order order_append order_by order_more order_prepend qualify
       reverse reverse_order select select_all select_append select_group select_more select_prepend server
       set_graph_aliases unfiltered ungraphed ungrouped union
       unlimited unordered where with with_recursive with_sql
@@ -689,7 +689,26 @@ module Sequel
     def lock_style(style)
       clone(:lock => style)
     end
-    
+
+    # Return a dataset with an Oracle-style MATCH_RECOGNIZE row pattern matching
+    # clause applied to the FROM table. Use Sequel.row_pattern to construct
+    # :pattern. Options:
+    # :partition_by :: columns/expressions for PARTITION BY
+    # :order_by :: columns/expressions for ORDER BY
+    # :measures :: hash or array of expression/alias pairs for MEASURES
+    # :after_match_skip :: :past_last_row, :to_next_row, :show_all_rows,
+    #                      or +{to: :variable} for AFTER MATCH SKIP
+    # :define :: hash or array of expression pairs for DEFINE
+    #
+    # Other options use regular Sequel expressions and placeholders.
+    def match_recognize(opts=OPTS)
+      raise(InvalidOperation, "MATCH_RECOGNIZE not supported on #{db.database_type}") unless supports_match_recognize?
+      raise(Error, "MATCH_RECOGNIZE cannot be used with datasets with custom SQL") if @opts[:sql]
+      raise(Error, "MATCH_RECOGNIZE requires a single FROM table") unless @opts[:from] && @opts[:from].length == 1
+      raise(Error, "MATCH_RECOGNIZE cannot be used with JOIN clauses") if @opts[:join]
+      clone(:match_recognize => SQL::MatchRecognize.new(opts))
+    end
+
     # Return a dataset with a WHEN MATCHED THEN DELETE clause added to the
     # MERGE statement.  If a block is passed, treat it as a virtual row and
     # use it as additional conditions for the match.

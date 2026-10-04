@@ -135,6 +135,11 @@ module Sequel
       false
     end
 
+    # Whether the dataset supports Oracle-style MATCH_RECOGNIZE, false by default.
+    def supports_match_recognize?
+      false
+    end
+
     # Whether modifying joined datasets is supported, false by default.
     def supports_modifying_joins?
       false

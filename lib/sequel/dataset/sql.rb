@@ -269,7 +269,7 @@ module Sequel
 
     def_sql_method(self, :delete, %w'delete from where')
     def_sql_method(self, :insert, %w'insert into columns values')
-    def_sql_method(self, :select, %w'with select distinct columns from join where group having compounds order limit lock')
+    def_sql_method(self, :select, %w'with select distinct columns from match_recognize join where group having compounds order limit lock')
     def_sql_method(self, :update, %w'update table set where')
 
     WILDCARD = LiteralString.new('*').freeze
@@ -280,7 +280,7 @@ module Sequel
     BITWISE_METHOD_MAP = {:& =>:BITAND, :| => :BITOR, :^ => :BITXOR}.freeze
     COUNT_FROM_SELF_OPTS = [:distinct, :group, :sql, :limit, :offset, :compounds].freeze
     IS_LITERALS = {nil=>'NULL'.freeze, true=>'TRUE'.freeze, false=>'FALSE'.freeze}.freeze
-    QUALIFY_KEYS = [:select, :where, :having, :order, :group].freeze
+    QUALIFY_KEYS = [:select, :where, :having, :order, :group, :match_recognize].freeze
 
     IS_OPERATORS = ::Sequel::SQL::ComplexExpression::IS_OPERATORS
     LIKE_OPERATORS = ::Sequel::SQL::ComplexExpression::LIKE_OPERATORS
@@ -628,6 +628,113 @@ module Sequel
           sql << " NULLS LAST"
         end
       end
+    end
+
+    def match_recognize_sql_append(sql, mr)
+      sql << 'MATCH_RECOGNIZE('
+      if partition = mr.partition
+        unless partition.empty?
+          sql << 'PARTITION BY '
+          expression_list_append(sql, partition)
+        end
+      end
+      if order = mr.order
+        unless order.empty?
+          match_recognize_clause_sql(sql, 'ORDER BY ')
+          expression_list_append(sql, order)
+        end
+      end
+      if measures = mr.measures
+        unless measures.empty?
+          match_recognize_clause_sql(sql, 'MEASURES ')
+          match_recognize_alias_list_append(sql, measures)
+        end
+      end
+      if strategy = mr.after_match_skip
+        match_recognize_clause_sql(sql, strategy[0] == :show ? 'AFTER MATCH ' : 'AFTER MATCH SKIP ')
+        if strategy[0] == :to
+          sql << 'TO '
+          quote_identifier_append(sql, strategy[1])
+        else
+          sql << strategy[1]
+        end
+      end
+      match_recognize_clause_sql(sql, 'PATTERN (')
+      literal_append(sql, mr.pattern)
+      sql << ') DEFINE '
+      c = false
+      mr.define.each do |variable, expression|
+        sql << ', ' if c
+        quote_identifier_append(sql, variable)
+        sql << ' AS '
+        literal_append(sql, expression)
+        c ||= true
+      end
+      sql << ')'
+    end
+
+    def row_pattern_concatenation_sql_append(sql, pattern)
+      row_pattern_children_sql_append(sql, pattern.children, ' ')
+    end
+
+    def row_pattern_alternation_sql_append(sql, pattern)
+      row_pattern_children_sql_append(sql, pattern.children, ' | ')
+    end
+
+    def row_pattern_grouping_sql_append(sql, pattern)
+      sql << '('
+      literal_append(sql, pattern.child)
+      sql << ')'
+    end
+
+    def row_pattern_repetition_sql_append(sql, pattern)
+      child = pattern.child
+      needs_group = child.is_a?(SQL::RowPattern::Concatenation) || child.is_a?(SQL::RowPattern::Alternation)
+      sql << '(' if needs_group
+      literal_append(sql, child)
+      sql << ')' if needs_group
+
+      case pattern.quantifier
+      when :maybe
+        sql << '?'
+      when :any
+        sql << '*'
+      when :one_or_more
+        sql << '+'
+      when Integer
+        sql << '{' << pattern.quantifier.to_s << '}'
+      when Range
+        sql << '{' << pattern.quantifier.begin.to_s << ',' << pattern.quantifier.end.to_s << '}'
+      end
+    end
+
+    def row_pattern_variable_sql_append(sql, pattern)
+      quote_identifier_append(sql, pattern.name)
+    end
+
+    def match_recognize_alias_list_append(sql, pairs)
+      c = false
+      pairs.each do |name, expression|
+        sql << ', ' if c
+        literal_append(sql, expression)
+        sql << ' AS '
+        quote_identifier_append(sql, name)
+        c ||= true
+      end
+    end
+
+    def row_pattern_children_sql_append(sql, children, separator)
+      c = false
+      children.each do |child|
+        sql << separator if c
+        literal_append(sql, child)
+        c ||= true
+      end
+    end
+
+    def match_recognize_clause_sql(sql, clause)
+      sql << ' ' unless sql.end_with?('(')
+      sql << clause
     end
 
     # Append literalization of placeholder literal string to SQL string.
@@ -1597,6 +1704,12 @@ module Sequel
       elsif f = empty_from_sql
         sql << f
       end
+    end
+
+    def select_match_recognize_sql(sql)
+      return unless mr = @opts[:match_recognize]
+      sql << ' '
+      literal_append(sql, mr)
     end
 
     def select_group_sql(sql)
